@@ -1,0 +1,11 @@
+-ignorewarnings
+-keep class org.mozilla.javascript.** { *; }
+-keep class org.schabi.newpipe.extractor.timeago.patterns.** { *; }
+-keep class org.schabi.newpipe.extractor.services.youtube.** { *; }
+-dontwarn org.mozilla.javascript.tools.**
+-dontwarn javax.script.**
+-dontwarn jdk.dynalink.**
+-dontwarn java.beans.**
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn edu.umd.cs.findbugs.annotations.**
+-dontwarn javax.annotation.**
