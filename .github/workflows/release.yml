@@ -41,7 +41,14 @@ jobs:
           KEYSTORE_PATH: ${{ runner.temp }}/release.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'ytgrabtemp' }}
           KEY_ALIAS: ytgrab
-        run: gradle :app:assembleRelease -Pvname=${{ steps.v.outputs.name }} -Pvcode=${{ github.run_number }} --no-daemon
+        run: |
+          set +e
+          gradle :app:assembleRelease -Pvname=${{ steps.v.outputs.name }} -Pvcode=${{ github.run_number }} --no-daemon --console=plain > build.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            grep -E "^e: |error:|What went wrong|Could not|Execution failed|Unresolved|ERROR:|Missing class" -A2 build.log | head -40 | cut -c1-300 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $code
       - name: Name the APK
         run: cp app/build/outputs/apk/release/app-release.apk "Ytgrab-${{ steps.v.outputs.name }}.apk"
       - uses: actions/upload-artifact@v4
