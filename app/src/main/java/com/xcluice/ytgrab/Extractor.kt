@@ -11,6 +11,7 @@ import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import org.schabi.newpipe.extractor.stream.Stream
 import org.schabi.newpipe.extractor.stream.StreamInfo
+import org.schabi.newpipe.extractor.stream.VideoStream
 import okhttp3.Request as OkRequest
 import org.schabi.newpipe.extractor.downloader.Request as NpRequest
 
@@ -55,12 +56,14 @@ object Extractor {
     fun looksLikeYoutube(s: String) = Regex("(youtu\\.be/|youtube\\.com/)", RegexOption.IGNORE_CASE).containsMatchIn(s)
 
     private fun prog(s: Stream) = s.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP
+    private fun isAv1(s: VideoStream) = s.codec?.startsWith("av01", ignoreCase = true) == true
+    private fun isH264(s: VideoStream) = s.codec?.startsWith("avc1", ignoreCase = true) == true
 
     suspend fun fetch(url: String): VideoInfo = withContext(Dispatchers.IO) {
         init()
         val si = StreamInfo.getInfo(url.trim())
-        val muxed = si.videoStreams.filter { prog(it) && it.format == MediaFormat.MPEG_4 }
-        val vOnly = si.videoOnlyStreams.filter { prog(it) && it.format == MediaFormat.MPEG_4 }
+        val muxed = si.videoStreams.filter { prog(it) && it.format == MediaFormat.MPEG_4 && !isAv1(it) }
+        val vOnly = si.videoOnlyStreams.filter { prog(it) && it.format == MediaFormat.MPEG_4 && !isAv1(it) }
         val aud = si.audioStreams.filter { prog(it) && it.format == MediaFormat.M4A }
         val heights = (muxed + vOnly).map { it.height }.filter { it in allowed }.distinct().sorted()
         VideoInfo(
@@ -82,8 +85,10 @@ object Extractor {
             val a = bestAudio ?: error("No audio stream available for this video")
             return Plan(null, a.content)
         }
-        val m = info.muxed.filter { it.height == height }.maxByOrNull { it.fps }
-        val v = info.vOnly.filter { it.height == height }.maxByOrNull { it.fps }
+        val mCandidates = info.muxed.filter { it.height == height }
+        val m = (mCandidates.filter(::isH264).ifEmpty { mCandidates }).maxByOrNull { it.fps }
+        val vCandidates = info.vOnly.filter { it.height == height }
+        val v = (vCandidates.filter(::isH264).ifEmpty { vCandidates }).maxByOrNull { it.fps }
         return when {
             m != null && !preferSplit && (height <= 360 || v == null || bestAudio == null) -> Plan(m.content, null)
             v != null && bestAudio != null -> Plan(v.content, bestAudio.content)
