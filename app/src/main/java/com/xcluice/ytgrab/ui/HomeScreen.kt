@@ -1,5 +1,6 @@
 package com.xcluice.ytgrab.ui
 
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
