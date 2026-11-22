@@ -207,7 +207,7 @@ fun HomeScreen(vm: HomeVM, onGoDownloads: () -> Unit) {
                     error = vm.tsError != null,
                     keyboard = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
-                AnimatedContent(vm.tsError ?: "Optional. Type 135 for 1:35.", transitionSpec = {
+                AnimatedContent(vm.tsError ?: "Optional. Saves data: only downloads from here (may start a few seconds early). Type 135 for 1:35.", transitionSpec = {
                     fadeIn(tween(200)) togetherWith fadeOut(tween(150))
                 }, label = "tsmsg") { m ->
                     Text(m, color = if (vm.tsError != null) C.Red else C.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp, start = 4.dp))

@@ -117,39 +117,23 @@ object Engine {
 
     private suspend fun run(info: VideoInfo, height: Int?, startSec: Long, work: File) {
         work.deleteRecursively(); work.mkdirs()
-        val plan = Extractor.plan(info, height)
+        val plan = Extractor.plan(info, height, preferSplit = startSec > 0)
         val id = System.currentTimeMillis().toString(36)
-
-        val vFile = plan.video?.let { File(work, "v.mp4") }
-        val aFile = plan.audio?.let { File(work, if (plan.video == null) "a.m4a" else "a.m4a") }
-        val vLen = plan.video?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
-        val aLen = plan.audio?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
-        val total = (vLen + aLen).coerceAtLeast(1L)
-        var done = 0L
-
-        suspend fun grab(url: String, f: File, len: Long, label: String) {
-            job.update { it.copy(phase = label) }
-            Net.download(url, f, len) { n ->
-                done += n
-                job.update { it.copy(progress = (done.toFloat() / total).coerceIn(0f, 1f) * 0.9f) }
-            }
-        }
-        if (plan.video != null && vFile != null) grab(plan.video, vFile, vLen, "Downloading video")
-        if (plan.audio != null && aFile != null) {
-            grab(plan.audio, aFile, aLen, if (plan.video == null) "Downloading audio" else "Downloading audio track")
-        }
-
         val ext = if (plan.video == null) "m4a" else "mp4"
         val out = File(dir, "$id.$ext")
-        val needTransform = (vFile != null && aFile != null) || startSec > 0
-        if (needTransform) {
-            job.update { it.copy(phase = if (startSec > 0) "Trimming and merging" else "Merging", progress = 0.9f) }
-            val tmp = File(work, "out.$ext")
-            transcode(vFile, aFile, startSec * 1000, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
-            tmp.copyTo(out, overwrite = true)
-        } else {
-            (vFile ?: aFile)!!.copyTo(out, overwrite = true)
+
+        var partialOk = false
+        if (startSec > 0) {
+            job.update { it.copy(phase = "Finding your start point") }
+            partialOk = try {
+                runPartial(plan, startSec, work, out, ext)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: ExportException) {
+                false
+            }
         }
+        if (!partialOk) runFull(plan, startSec, work, out, ext)
 
         val thumbName = info.thumb?.let { u ->
             withContext(Dispatchers.IO) { Net.bytes(u) }?.let { b ->
@@ -161,6 +145,74 @@ object Engine {
         items.update { listOf(item) + it }
         save()
         job.value = JobState(finished = true, title = info.title, progress = 1f)
+    }
+
+    /** Downloads ONLY the data from the segment containing startSec onward. */
+    private suspend fun runPartial(plan: Plan, startSec: Long, work: File, out: File, ext: String): Boolean {
+        val vLen = plan.video?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
+        val aLen = plan.audio?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
+        val vSeg = plan.video?.let { Net.findStart(it, vLen, startSec) ?: return false }
+        val aSeg = plan.audio?.let { Net.findStart(it, aLen, startSec) ?: return false }
+        val vNeed = if (vSeg != null) vLen - vSeg.offset + vSeg.init.size else 0L
+        val aNeed = if (aSeg != null) aLen - aSeg.offset + aSeg.init.size else 0L
+        val total = (vNeed + aNeed).coerceAtLeast(1L)
+        var done = 0L
+
+        suspend fun grab(url: String, seg: Net.Seg, len: Long, f: File, label: String) {
+            job.update { it.copy(phase = label) }
+            f.writeBytes(seg.init)
+            done += seg.init.size
+            Net.download(url, f, len, from = seg.offset, append = true) { n ->
+                done += n
+                job.update { it.copy(progress = (done.toFloat() / total).coerceIn(0f, 1f) * 0.9f) }
+            }
+        }
+        val vFile = File(work, "v.mp4")
+        val aFile = File(work, "a.m4a")
+        if (plan.video != null && vSeg != null) grab(plan.video, vSeg, vLen, vFile, "Downloading video from your start")
+        if (plan.audio != null && aSeg != null) grab(plan.audio, aSeg, aLen, aFile, "Downloading audio from your start")
+
+        if (plan.video != null && plan.audio != null) {
+            job.update { it.copy(phase = "Merging", progress = 0.9f) }
+            val tmp = File(work, "out.$ext")
+            transcode(vFile, aFile, 0L, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
+            tmp.copyTo(out, overwrite = true)
+        } else {
+            (if (plan.video != null) vFile else aFile).copyTo(out, overwrite = true)
+        }
+        return true
+    }
+
+    /** Fallback: download everything, then cut from startSec. */
+    private suspend fun runFull(plan: Plan, startSec: Long, work: File, out: File, ext: String) {
+        work.deleteRecursively(); work.mkdirs()
+        val vFile = plan.video?.let { File(work, "v.mp4") }
+        val aFile = plan.audio?.let { File(work, "a.m4a") }
+        val vLen = plan.video?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
+        val aLen = plan.audio?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
+        val total = (vLen + aLen).coerceAtLeast(1L)
+        var done = 0L
+
+        suspend fun grab(url: String, f: File, len: Long, label: String) {
+            job.update { it.copy(phase = label, progress = 0f) }
+            Net.download(url, f, len) { n ->
+                done += n
+                job.update { it.copy(progress = (done.toFloat() / total).coerceIn(0f, 1f) * 0.9f) }
+            }
+        }
+        if (plan.video != null && vFile != null) grab(plan.video, vFile, vLen, "Downloading video")
+        if (plan.audio != null && aFile != null) {
+            grab(plan.audio, aFile, aLen, if (plan.video == null) "Downloading audio" else "Downloading audio track")
+        }
+        val needTransform = (vFile != null && aFile != null) || startSec > 0
+        if (needTransform) {
+            job.update { it.copy(phase = if (startSec > 0) "Trimming and merging" else "Merging", progress = 0.9f) }
+            val tmp = File(work, "out.$ext")
+            transcode(vFile, aFile, startSec * 1000, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
+            tmp.copyTo(out, overwrite = true)
+        } else {
+            (vFile ?: aFile)!!.copyTo(out, overwrite = true)
+        }
     }
 
     private suspend fun transcode(

@@ -76,7 +76,7 @@ object Extractor {
     }
 
     /** height == null means audio only. */
-    fun plan(info: VideoInfo, height: Int?): Plan {
+    fun plan(info: VideoInfo, height: Int?, preferSplit: Boolean = false): Plan {
         val bestAudio = info.audio.maxByOrNull { it.averageBitrate }
         if (height == null) {
             val a = bestAudio ?: error("No audio stream available for this video")
@@ -85,8 +85,9 @@ object Extractor {
         val m = info.muxed.filter { it.height == height }.maxByOrNull { it.fps }
         val v = info.vOnly.filter { it.height == height }.maxByOrNull { it.fps }
         return when {
-            m != null && (height <= 360 || v == null || bestAudio == null) -> Plan(m.content, null)
+            m != null && !preferSplit && (height <= 360 || v == null || bestAudio == null) -> Plan(m.content, null)
             v != null && bestAudio != null -> Plan(v.content, bestAudio.content)
+            m != null -> Plan(m.content, null)
             else -> error("${height}p is not available for this video")
         }
     }
