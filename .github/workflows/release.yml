@@ -28,17 +28,6 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Decode keystore
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'ytgrabtemp' }}
-        run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          else
-            echo "::warning::No signing secrets set; using a temporary key. Updates will not install over older builds."
-            keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -alias ytgrab -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" -dname "CN=Xcluice"
-          fi
       - name: Version
         id: v
         run: |
@@ -50,10 +39,6 @@ jobs:
           echo "name=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v$V" >> "$GITHUB_OUTPUT"
       - name: Build release APK
-        env:
-          KEYSTORE_PATH: ${{ runner.temp }}/release.jks
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'ytgrabtemp' }}
-          KEY_ALIAS: ytgrab
         run: |
           set +e
           gradle :app:assembleRelease -Pvname=${{ steps.v.outputs.name }} -Pvcode=${{ github.run_number }} --no-daemon --console=plain > build.log 2>&1

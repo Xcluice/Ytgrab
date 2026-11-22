@@ -20,12 +20,10 @@ android {
     signingConfigs {
         create("release") {
             val path = System.getenv("KEYSTORE_PATH")
-            if (path != null) {
-                storeFile = file(path)
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("KEY_ALIAS")
-                keyPassword = System.getenv("KEYSTORE_PASSWORD")
-            }
+            storeFile = if (path != null) file(path) else file("release.jks")
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "xcluice2026"
+            keyAlias = System.getenv("KEY_ALIAS") ?: "ytgrab"
+            keyPassword = System.getenv("KEYSTORE_PASSWORD") ?: "xcluice2026"
         }
     }
 
