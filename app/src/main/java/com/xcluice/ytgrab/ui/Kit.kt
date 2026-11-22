@@ -50,6 +50,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -246,9 +248,12 @@ fun Field(
     keyboard: KeyboardOptions = KeyboardOptions.Default, trailing: @Composable (() -> Unit)? = null,
 ) {
     val border by animateColorAsState(if (error) C.Red else C.Line, tween(250), label = "fb")
+    val focus = remember { FocusRequester() }
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(C.Surface)
-            .border(1.dp, border, RoundedCornerShape(18.dp)).padding(horizontal = 16.dp, vertical = 15.dp),
+            .border(1.dp, border, RoundedCornerShape(18.dp))
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { focus.requestFocus() }
+            .padding(horizontal = 16.dp, vertical = 15.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(Modifier.weight(1f)) {
@@ -260,6 +265,7 @@ fun Field(
                 textStyle = TextStyle(color = C.Text, fontSize = 16.sp),
                 cursorBrush = SolidColor(C.Red),
                 keyboardOptions = keyboard,
+                modifier = Modifier.fillMaxWidth().focusRequester(focus),
             )
         }
         trailing?.invoke()
