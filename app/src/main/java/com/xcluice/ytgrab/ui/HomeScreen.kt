@@ -86,7 +86,6 @@ class HomeVM : ViewModel() {
             load = try {
                 val info = Extractor.fetch(s)
                 quality = info.heights.lastOrNull { it <= 720 } ?: info.heights.lastOrNull() ?: 0
-                digits = ""
                 Load.Ready(info)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -103,9 +102,9 @@ class HomeVM : ViewModel() {
 
     val tsError: String?
         get() {
-            val info = (load as? Load.Ready)?.info ?: return null
-            val s = startSec ?: return "Seconds must be under 60."
             if (digits.isEmpty()) return null
+            val s = startSec ?: return "Minutes and seconds must be under 60."
+            val info = (load as? Load.Ready)?.info ?: return null
             if (info.duration > 0 && s >= info.duration - 1) return "This video is only ${Ts.clock(info.duration)} long."
             return null
         }
@@ -198,21 +197,30 @@ fun HomeScreen(vm: HomeVM, onGoDownloads: () -> Unit) {
                     info.heights.forEach { h -> Chip("${h}p", vm.quality == h) { vm.quality = h } }
                     Chip("Audio", vm.quality == 0) { vm.quality = 0 }
                 }
-
-                Label("Start from")
-                Field(
-                    value = Ts.format(vm.digits),
-                    onValue = { vm.digits = it.filter(Char::isDigit).take(6) },
-                    hint = "0:00",
-                    error = vm.tsError != null,
-                    keyboard = KeyboardOptions(keyboardType = KeyboardType.Number),
-                )
-                AnimatedContent(vm.tsError ?: "Optional. Saves data: only downloads from here (may start a few seconds early). Type 135 for 1:35.", transitionSpec = {
-                    fadeIn(tween(200)) togetherWith fadeOut(tween(150))
-                }, label = "tsmsg") { m ->
-                    Text(m, color = if (vm.tsError != null) C.Red else C.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp, start = 4.dp))
-                }
             }
+        }
+
+        Label("Start timestamp")
+        Field(
+            value = Ts.format(vm.digits),
+            onValue = { vm.digits = it.filter(Char::isDigit).trimStart('0').take(6) },
+            hint = "0:00 (e.g. 135 for 1:35)",
+            error = vm.tsError != null,
+            keyboard = KeyboardOptions(keyboardType = KeyboardType.Number),
+            trailing = if (vm.digits.isNotEmpty()) {
+                {
+                    Box(Modifier.pressable { vm.digits = "" }.padding(4.dp)) {
+                        Glyph(G.Close, C.Muted, 20.dp)
+                    }
+                }
+            } else null,
+        )
+        AnimatedContent(
+            vm.tsError ?: "Optional. Downloads only from this timestamp to save data (may start a few seconds early).",
+            transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(150)) },
+            label = "tsmsg",
+        ) { m ->
+            Text(m, color = if (vm.tsError != null) C.Red else C.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp, start = 4.dp))
         }
 
         Spacer(Modifier.height(26.dp))
@@ -260,6 +268,7 @@ fun HomeScreen(vm: HomeVM, onGoDownloads: () -> Unit) {
                     val ready = load is Load.Ready && vm.tsError == null
                     val label = when {
                         !ready -> "Download"
+                        vm.quality == 0 && vm.digits.isNotEmpty() -> "Download audio from ${Ts.format(vm.digits)}"
                         vm.quality == 0 -> "Download audio"
                         vm.digits.isNotEmpty() -> "Download ${vm.quality}p from ${Ts.format(vm.digits)}"
                         else -> "Download ${vm.quality}p"
