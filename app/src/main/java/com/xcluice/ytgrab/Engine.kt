@@ -180,7 +180,7 @@ object Engine {
                 val f = video ?: audio!!
                 seqs += EditedMediaItemSequence(item(f, noAudio = false, noVideo = false))
             }
-            val composition = Composition.Builder(*seqs.toTypedArray()).build()
+            val composition = Composition.Builder(seqs).build()
 
             val handler = Handler(Looper.getMainLooper())
             val holder = ProgressHolder()
