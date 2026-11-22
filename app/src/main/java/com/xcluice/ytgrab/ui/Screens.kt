@@ -165,8 +165,8 @@ fun ForceUpdate(req: Update.Required) {
 }
 
 @Composable
-fun Root() {
-    var splash by remember { mutableStateOf(true) }
+fun Root(sharedUrl: Pair<String, Long>? = null, onSharedConsumed: () -> Unit = {}) {
+    var splash by remember { mutableStateOf(sharedUrl == null) }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var prev by remember { mutableIntStateOf(0) }
     var playing by remember { mutableStateOf<DlItem?>(null) }
@@ -176,6 +176,15 @@ fun Root() {
     LaunchedEffect(Unit) { Updater.check() }
 
     fun go(t: Int) { prev = tab; tab = t }
+
+    LaunchedEffect(sharedUrl) {
+        val url = sharedUrl?.first ?: return@LaunchedEffect
+        splash = false
+        playing = null
+        go(0)
+        vm.onUrl(url)
+        onSharedConsumed()
+    }
 
     Box(Modifier.fillMaxSize().background(C.Bg)) {
         Box(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
