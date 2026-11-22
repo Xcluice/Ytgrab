@@ -2,34 +2,26 @@ package com.xcluice.ytgrab
 
 import android.app.Application
 import android.content.Intent
-import android.net.Uri
-import android.os.Handler
-import android.os.Looper
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import androidx.core.content.ContextCompat
-import androidx.media3.common.MediaItem
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.EditedMediaItemSequence
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.ProgressHolder
-import androidx.media3.transformer.Transformer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import java.nio.ByteBuffer
 
 object Engine {
     lateinit var app: Application
@@ -129,7 +121,7 @@ object Engine {
                 runPartial(plan, startSec, work, out, ext)
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: ExportException) {
+            } catch (e: Exception) {
                 false
             }
         }
@@ -162,9 +154,11 @@ object Engine {
             job.update { it.copy(phase = label) }
             f.writeBytes(seg.init)
             done += seg.init.size
+            var last = -1
             Net.download(url, f, len, from = seg.offset, append = true) { n ->
                 done += n
-                job.update { it.copy(progress = (done.toFloat() / total).coerceIn(0f, 1f) * 0.9f) }
+                val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
+                if (p != last) { last = p; job.update { it.copy(progress = p / 100f) } }
             }
         }
         val vFile = File(work, "v.mp4")
@@ -175,7 +169,7 @@ object Engine {
         if (plan.video != null && plan.audio != null) {
             job.update { it.copy(phase = "Merging", progress = 0.9f) }
             val tmp = File(work, "out.$ext")
-            transcode(vFile, aFile, 0L, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
+            remux(vFile, aFile, 0L, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
             tmp.copyTo(out, overwrite = true)
         } else {
             (if (plan.video != null) vFile else aFile).copyTo(out, overwrite = true)
@@ -195,9 +189,11 @@ object Engine {
 
         suspend fun grab(url: String, f: File, len: Long, label: String) {
             job.update { it.copy(phase = label, progress = 0f) }
+            var last = -1
             Net.download(url, f, len) { n ->
                 done += n
-                job.update { it.copy(progress = (done.toFloat() / total).coerceIn(0f, 1f) * 0.9f) }
+                val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
+                if (p != last) { last = p; job.update { it.copy(progress = p / 100f) } }
             }
         }
         if (plan.video != null && vFile != null) grab(plan.video, vFile, vLen, "Downloading video")
@@ -208,64 +204,109 @@ object Engine {
         if (needTransform) {
             job.update { it.copy(phase = if (startSec > 0) "Trimming and merging" else "Merging", progress = 0.9f) }
             val tmp = File(work, "out.$ext")
-            transcode(vFile, aFile, startSec * 1000, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
+            remux(vFile, aFile, startSec * 1000, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
             tmp.copyTo(out, overwrite = true)
         } else {
             (vFile ?: aFile)!!.copyTo(out, overwrite = true)
         }
     }
 
-    private suspend fun transcode(
+    /**
+     * Copies (never re-encodes) the video/audio samples into one MP4, starting from the
+     * keyframe at or before startMs. Runs off the main thread and is cancellable.
+     */
+    private suspend fun remux(
         video: File?, audio: File?, startMs: Long, out: File, onProgress: (Float) -> Unit,
-    ) = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine<Unit> { cont ->
-            val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(startMs).build()
-            fun item(f: File, noAudio: Boolean, noVideo: Boolean) = EditedMediaItem.Builder(
-                MediaItem.Builder().setUri(Uri.fromFile(f)).setClippingConfiguration(clip).build()
-            ).setRemoveAudio(noAudio).setRemoveVideo(noVideo).build()
+    ) = withContext(Dispatchers.IO) {
+        class T(val ex: MediaExtractor) {
+            val outIdx = HashMap<Int, Int>()
+            var isVideo = false
+            var maxSize = 2 shl 20
+        }
 
-            val seqs = mutableListOf<EditedMediaItemSequence>()
-            if (video != null && audio != null) {
-                seqs += EditedMediaItemSequence(item(video, noAudio = true, noVideo = false))
-                seqs += EditedMediaItemSequence(item(audio, noAudio = false, noVideo = true))
-            } else {
-                val f = video ?: audio!!
-                seqs += EditedMediaItemSequence(item(f, noAudio = false, noVideo = false))
-            }
-            val composition = Composition.Builder(seqs).build()
-
-            val handler = Handler(Looper.getMainLooper())
-            val holder = ProgressHolder()
-            var finished = false
-            val transformer = Transformer.Builder(app)
-                .addListener(object : Transformer.Listener {
-                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                        finished = true
-                        if (cont.isActive) cont.resume(Unit)
+        val extractors = mutableListOf<MediaExtractor>()
+        val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var started = false
+        try {
+            val sources = mutableListOf<T>()
+            var durationUs = 0L
+            val split = video != null && audio != null
+            for (f in listOfNotNull(video, audio)) {
+                val ex = MediaExtractor().apply { setDataSource(f.absolutePath) }
+                extractors += ex
+                val t = T(ex)
+                for (i in 0 until ex.trackCount) {
+                    val fmt = ex.getTrackFormat(i)
+                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                    val isV = mime.startsWith("video/")
+                    val isA = mime.startsWith("audio/")
+                    val take = when {
+                        split && f == video -> isV
+                        split && f == audio -> isA
+                        else -> isV || isA
                     }
-
-                    override fun onError(
-                        composition: Composition, exportResult: ExportResult, exportException: ExportException,
-                    ) {
-                        finished = true
-                        if (cont.isActive) cont.resumeWithException(exportException)
+                    if (!take) continue
+                    ex.selectTrack(i)
+                    if (isV) {
+                        t.isVideo = true
+                        if (fmt.containsKey(MediaFormat.KEY_ROTATION)) {
+                            runCatching { muxer.setOrientationHint(fmt.getInteger(MediaFormat.KEY_ROTATION)) }
+                        }
                     }
-                }).build()
-            val poll = object : Runnable {
-                override fun run() {
-                    if (finished) return
-                    if (transformer.getProgress(holder) != Transformer.PROGRESS_STATE_NOT_STARTED) {
-                        onProgress(holder.progress / 100f)
-                    }
-                    handler.postDelayed(this, 300)
+                    if (fmt.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) t.maxSize = maxOf(t.maxSize, fmt.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                    if (fmt.containsKey(MediaFormat.KEY_DURATION)) durationUs = maxOf(durationUs, fmt.getLong(MediaFormat.KEY_DURATION))
+                    t.outIdx[i] = muxer.addTrack(fmt)
                 }
+                if (t.outIdx.isNotEmpty()) sources += t
             }
-            transformer.start(composition, out.absolutePath)
-            handler.post(poll)
-            cont.invokeOnCancellation {
-                handler.post { runCatching { transformer.cancel() } }
-                handler.removeCallbacks(poll)
+            if (sources.isEmpty()) throw IOException("No playable tracks found")
+
+            // Seek: video to the keyframe at/before start, then the rest to that same time.
+            val startUs = startMs * 1000
+            var originUs = 0L
+            if (startUs > 0) {
+                val v = sources.firstOrNull { it.isVideo }
+                if (v != null) {
+                    v.ex.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                    originUs = v.ex.sampleTime.coerceAtLeast(0L)
+                } else originUs = startUs
+                sources.filter { it !== v }.forEach { it.ex.seekTo(originUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC) }
             }
+
+            // Re-base so the output always starts at 0 (partial downloads begin at their start time).
+            originUs = sources.minOf { it.ex.sampleTime.coerceAtLeast(0L) }
+
+            muxer.start(); started = true
+            val buf = ByteBuffer.allocate(sources.maxOf { it.maxSize })
+            val bi = MediaCodec.BufferInfo()
+            val total = (durationUs - originUs).coerceAtLeast(1L)
+            var lastPct = -1
+            while (true) {
+                ensureActive()
+                // Interleave: always write from the source whose next sample is earliest.
+                var next: T? = null
+                var nextT = Long.MAX_VALUE
+                for (t in sources) {
+                    val st = t.ex.sampleTime
+                    if (st >= 0 && st < nextT) { next = t; nextT = st }
+                }
+                val t = next ?: break
+                val dst = t.outIdx[t.ex.sampleTrackIndex]
+                if (dst == null) { t.ex.advance(); continue }
+                buf.clear()
+                val n = t.ex.readSampleData(buf, 0)
+                if (n < 0) { t.ex.advance(); continue }
+                bi.set(0, n, (nextT - originUs).coerceAtLeast(0L),
+                    if (t.ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                muxer.writeSampleData(dst, buf, bi)
+                t.ex.advance()
+                val pct = ((nextT - originUs).toFloat() / total * 100).toInt().coerceIn(0, 100)
+                if (pct != lastPct) { lastPct = pct; onProgress(pct / 100f) }
+            }
+        } finally {
+            if (started) runCatching { muxer.stop() }
+            runCatching { muxer.release() }
+            extractors.forEach { runCatching { it.release() } }
         }
     }
 }
