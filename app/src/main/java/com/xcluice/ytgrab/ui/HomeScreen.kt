@@ -85,7 +85,10 @@ class HomeVM : ViewModel() {
             delay(450)
             load = try {
                 val info = Extractor.fetch(s)
-                quality = info.heights.lastOrNull { it <= 720 } ?: info.heights.lastOrNull() ?: 0
+                quality = when {
+                    360 in info.heights -> 360
+                    else -> info.heights.lastOrNull { it <= 360 } ?: info.heights.firstOrNull() ?: 0
+                }
                 Load.Ready(info)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e

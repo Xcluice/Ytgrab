@@ -1,8 +1,5 @@
 package com.xcluice.ytgrab.ui
 
-import android.content.ActivityNotFoundException
-import android.content.Intent
-import android.widget.Toast
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
@@ -43,13 +40,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.xcluice.ytgrab.DlItem
 import com.xcluice.ytgrab.Engine
 import java.io.File
@@ -58,25 +53,10 @@ import java.util.Locale
 private fun size(b: Long): String =
     if (b >= 1_000_000_000) String.format(Locale.US, "%.1f GB", b / 1e9) else String.format(Locale.US, "%.0f MB", b / 1e6)
 
-private fun play(ctx: android.content.Context, item: DlItem) {
-    val f = File(Engine.dir, item.file)
-    val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", f)
-    val mime = if (item.label == "Audio") "audio/mp4" else "video/mp4"
-    try {
-        ctx.startActivity(
-            Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
-    } catch (e: ActivityNotFoundException) {
-        Toast.makeText(ctx, "No app found to play this file", Toast.LENGTH_SHORT).show()
-    }
-}
-
 @Composable
-fun DownloadsScreen(onGoHome: () -> Unit) {
+fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
     val items by Engine.items.collectAsState()
     val job by Engine.job.collectAsState()
-    val ctx = LocalContext.current
     var confirm by remember { mutableStateOf<DlItem?>(null) }
 
     Box(Modifier.fillMaxSize()) {
@@ -108,7 +88,7 @@ fun DownloadsScreen(onGoHome: () -> Unit) {
                     items(items, key = { it.id }) { item ->
                         Row(
                             Modifier.fillMaxWidth().animateItem().clip(RoundedCornerShape(22.dp)).background(C.Surface)
-                                .pressable { play(ctx, item) }.padding(12.dp),
+                                .pressable { onPlay(item) }.padding(12.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Thumb(item.id, Modifier.size(112.dp, 70.dp).clip(RoundedCornerShape(14.dp))) {

@@ -4,7 +4,6 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -17,7 +16,9 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -47,7 +48,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
@@ -56,6 +56,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xcluice.ytgrab.DlItem
 import com.xcluice.ytgrab.Engine
 import com.xcluice.ytgrab.Update
 import com.xcluice.ytgrab.Updater
@@ -168,6 +169,7 @@ fun Root() {
     var splash by remember { mutableStateOf(true) }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var prev by remember { mutableIntStateOf(0) }
+    var playing by remember { mutableStateOf<DlItem?>(null) }
     val upd by Updater.state.collectAsState()
     val job by Engine.job.collectAsState()
     val vm: HomeVM = viewModel()
@@ -186,9 +188,17 @@ fun Root() {
                 },
                 label = "tabs",
             ) { t ->
-                if (t == 0) HomeScreen(vm) { go(1) } else DownloadsScreen { go(0) }
+                if (t == 0) HomeScreen(vm) { go(1) } else DownloadsScreen(onGoHome = { go(0) }, onPlay = { playing = it })
             }
             Box(Modifier.align(Alignment.BottomCenter)) { NavPill(tab, job.active) { go(it) } }
+        }
+
+        AnimatedVisibility(
+            playing != null,
+            enter = fadeIn(tween(220)) + slideInVertically(tween(260)) { it / 10 },
+            exit = fadeOut(tween(180)) + slideOutVertically(tween(220)) { it / 10 },
+        ) {
+            playing?.let { PlayerScreen(item = it, onClose = { playing = null }) }
         }
 
         AnimatedVisibility(upd is Update.Required, enter = fadeIn(tween(400)) + scaleIn(initialScale = 1.06f), exit = fadeOut()) {

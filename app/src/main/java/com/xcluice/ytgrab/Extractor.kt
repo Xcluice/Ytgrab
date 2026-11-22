@@ -8,6 +8,8 @@ import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.downloader.Downloader
 import org.schabi.newpipe.extractor.downloader.Response
 import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.AudioTrackType
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import org.schabi.newpipe.extractor.stream.Stream
 import org.schabi.newpipe.extractor.stream.StreamInfo
@@ -59,6 +61,18 @@ object Extractor {
     private fun isAv1(s: VideoStream) = s.codec?.startsWith("av01", ignoreCase = true) == true
     private fun isH264(s: VideoStream) = s.codec?.startsWith("avc1", ignoreCase = true) == true
 
+    private fun pickOriginalAudio(streams: List<AudioStream>): AudioStream? {
+        if (streams.isEmpty()) return null
+        val orig = streams.filter { it.audioTrackType == AudioTrackType.ORIGINAL }
+        if (orig.isNotEmpty()) return orig.maxByOrNull { it.averageBitrate }
+        val untagged = streams.filter { it.audioTrackType == null }
+        if (untagged.isNotEmpty()) return untagged.maxByOrNull { it.averageBitrate }
+        val nonDubbed = streams.filter {
+            it.audioTrackType != AudioTrackType.DUBBED && it.audioTrackType != AudioTrackType.DESCRIPTIVE
+        }
+        return (nonDubbed.ifEmpty { streams }).maxByOrNull { it.averageBitrate }
+    }
+
     suspend fun fetch(url: String): VideoInfo = withContext(Dispatchers.IO) {
         init()
         val si = StreamInfo.getInfo(url.trim())
@@ -80,7 +94,7 @@ object Extractor {
 
     /** height == null means audio only. */
     fun plan(info: VideoInfo, height: Int?, preferSplit: Boolean = false): Plan {
-        val bestAudio = info.audio.maxByOrNull { it.averageBitrate }
+        val bestAudio = pickOriginalAudio(info.audio)
         if (height == null) {
             val a = bestAudio ?: error("No audio stream available for this video")
             return Plan(null, a.content)
@@ -89,8 +103,13 @@ object Extractor {
         val m = (mCandidates.filter(::isH264).ifEmpty { mCandidates }).maxByOrNull { it.fps }
         val vCandidates = info.vOnly.filter { it.height == height }
         val v = (vCandidates.filter(::isH264).ifEmpty { vCandidates }).maxByOrNull { it.fps }
+        // If multi-language/dubbed audio tracks exist, avoid muxed 360p which YouTube may auto-dub.
+        val hasMultiAudio = info.audio.any {
+            it.audioTrackType == AudioTrackType.ORIGINAL || it.audioTrackType == AudioTrackType.DUBBED
+        }
         return when {
-            m != null && !preferSplit && (height <= 360 || v == null || bestAudio == null) -> Plan(m.content, null)
+            m != null && !preferSplit && !hasMultiAudio && (height <= 360 || v == null || bestAudio == null) ->
+                Plan(m.content, null)
             v != null && bestAudio != null -> Plan(v.content, bestAudio.content)
             m != null -> Plan(m.content, null)
             else -> error("${height}p is not available for this video")
