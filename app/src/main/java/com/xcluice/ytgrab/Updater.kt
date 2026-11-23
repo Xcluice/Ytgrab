@@ -3,6 +3,7 @@ package com.xcluice.ytgrab
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
@@ -16,7 +17,7 @@ import java.io.IOException
 sealed interface Update {
     data object Unknown : Update
     data object Current : Update
-    data class Required(val version: String, val apkUrl: String) : Update
+    data class Required(val version: String, val apkUrl: String, val notes: String) : Update
 }
 
 object Updater {
@@ -34,19 +35,41 @@ object Updater {
         return false
     }
 
+    private fun cleanNotes(raw: String): String {
+        val lines = raw.lines()
+            .map { it.trim() }
+            .filter { line ->
+                line.isNotEmpty() &&
+                    !line.startsWith("#") &&
+                    !line.startsWith("**Full Changelog**")
+            }
+            .map { line ->
+                line.replace(Regex("^[-*]\\s+"), "• ")
+                    .replace(Regex("\\s+by\\s+@\\S+\\s+in\\s+https?://\\S+"), "")
+                    .replace(Regex("\\s+in\\s+https?://\\S+"), "")
+                    .trim()
+            }
+            .filter { it.isNotEmpty() }
+        return if (lines.isNotEmpty()) lines.joinToString("\n") else "Bug fixes and improvements."
+    }
+
     suspend fun check() = withContext(Dispatchers.IO) {
         state.value = try {
             val req = Request.Builder().url(API).header("Accept", "application/vnd.github+json").build()
             val json = JSONObject(Net.client.newCall(req).execute().use { it.body!!.string() })
             val tag = json.getString("tag_name")
+            val notes = cleanNotes(json.optString("body", ""))
             val assets = json.getJSONArray("assets")
             var apk: String? = null
             for (i in 0 until assets.length()) {
                 val a = assets.getJSONObject(i)
                 if (a.getString("name").endsWith(".apk")) apk = a.getString("browser_download_url")
             }
-            if (apk != null && newer(tag, BuildConfig.VERSION_NAME)) Update.Required(tag.removePrefix("v"), apk)
-            else Update.Current
+            if (apk != null && newer(tag, BuildConfig.VERSION_NAME)) {
+                Update.Required(tag.removePrefix("v"), apk, notes)
+            } else {
+                Update.Current
+            }
         } catch (e: Exception) {
             Update.Current
         }
@@ -79,7 +102,7 @@ object Updater {
 
     /** Returns false if the user must first allow installs from this app. */
     fun install(ctx: Context, f: File): Boolean {
-        if (!ctx.packageManager.canRequestPackageInstalls()) {
+        if (Build.VERSION.SDK_INT >= 26 && !ctx.packageManager.canRequestPackageInstalls()) {
             ctx.startActivity(
                 Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}"))
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

@@ -5,7 +5,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import android.net.Uri
-import android.view.SurfaceView
+import android.view.TextureView
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -39,6 +38,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.movableContentOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -337,6 +337,19 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
     val shownMs = if (dragging) dragMs else posMs
     val progress = if (durMs > 0L) (shownMs.toFloat() / durMs.toFloat()).coerceIn(0f, 1f) else 0f
 
+    // Single reusable TextureView preserved across portrait/fullscreen transitions (reliable on Android 8.0 Oreo).
+    val videoSurface = remember(player) {
+        movableContentOf<Modifier> { surfaceModifier ->
+            AndroidView(
+                factory = { context ->
+                    TextureView(context).also { tv -> player.setVideoTextureView(tv) }
+                },
+                onRelease = { tv -> player.clearVideoTextureView(tv) },
+                modifier = surfaceModifier,
+            )
+        }
+    }
+
     @Composable
     fun VideoViewport(modifier: Modifier) {
         Box(
@@ -373,12 +386,7 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                     } else {
                         (maxHeight * ratio) to maxHeight
                     }
-                    AndroidView(
-                        factory = { context ->
-                            SurfaceView(context).also { sv -> player.setVideoSurfaceView(sv) }
-                        },
-                        modifier = Modifier.size(vw, vh),
-                    )
+                    videoSurface(Modifier.size(vw, vh))
                 }
             }
 

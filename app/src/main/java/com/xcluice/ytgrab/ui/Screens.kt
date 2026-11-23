@@ -22,6 +22,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,11 +30,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -110,7 +114,7 @@ fun ForceUpdate(req: Update.Required) {
         Modifier.fillMaxSize().background(C.Bg).systemBarsPadding().padding(28.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {
-        Box(Modifier.size(200.dp), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(164.dp), contentAlignment = Alignment.Center) {
             Canvas(Modifier.fillMaxSize()) {
                 val r = size.minDimension / 2
                 listOf(p1, p2).forEach { p ->
@@ -118,16 +122,39 @@ fun ForceUpdate(req: Update.Required) {
                 }
             }
             Box(
-                Modifier.size(92.dp).graphicsLayer { translationY = bob }.clip(RoundedCornerShape(30.dp)).background(C.Surface),
+                Modifier.size(84.dp).graphicsLayer { translationY = bob }.clip(RoundedCornerShape(28.dp)).background(C.Surface),
                 contentAlignment = Alignment.Center,
-            ) { Glyph(G.Down, C.Teal, 42.dp, 2.4f) }
+            ) { Glyph(G.Down, C.Teal, 38.dp, 2.4f) }
         }
-        Spacer(Modifier.height(28.dp))
-        Text("Update required", fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(22.dp))
+        Text("Update required", fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
         Text(
-            "Ytgrab ${req.version} is out. This version stops working when YouTube changes, so you need to update to keep downloading.",
-            color = C.Muted, fontSize = 15.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 12.dp, bottom = 30.dp),
+            "Ytgrab ${req.version} is out.",
+            color = C.Muted, fontSize = 14.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 6.dp),
         )
+
+        Spacer(Modifier.height(18.dp))
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(18.dp))
+                .background(C.Surface)
+                .border(1.dp, C.Line, RoundedCornerShape(18.dp))
+                .padding(16.dp),
+        ) {
+            Text("What's new", color = C.Teal, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            Box(Modifier.fillMaxWidth().heightIn(max = 160.dp).verticalScroll(rememberScrollState())) {
+                Text(
+                    req.notes.ifBlank { "Bug fixes and improvements." },
+                    color = C.Text,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
         AnimatedContent(phase, transitionSpec = { fadeIn(tween(250)) togetherWith fadeOut(tween(150)) }, label = "upd") { ph ->
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                 when (ph) {
