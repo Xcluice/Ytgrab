@@ -1,23 +1,35 @@
 package com.xcluice.ytgrab
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 
 class HttpStatusException(val code: Int) : IOException("HTTP $code")
 
 object Net {
     const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    const val CHUNK_SIZE = 524_288L // 512 KB chunks: fast parallel throughput + fine-grained resume
 
     val client: OkHttpClient = OkHttpClient.Builder()
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 16
+            maxRequestsPerHost = 8
+        })
+        .connectionPool(ConnectionPool(8, 2, TimeUnit.MINUTES))
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(25, TimeUnit.SECONDS)
@@ -47,58 +59,157 @@ object Net {
         null
     }
 
+    /** Returns how many payload bytes are already safely completed in doneFile. */
+    fun completedBytes(doneFile: File, payloadLen: Long): Long {
+        if (payloadLen <= 0L || !doneFile.exists()) return 0L
+        val numChunks = ((payloadLen + CHUNK_SIZE - 1) / CHUNK_SIZE).toInt()
+        if (doneFile.length() != numChunks.toLong()) return 0L
+        val map = runCatching { doneFile.readBytes() }.getOrNull() ?: return 0L
+        var total = 0L
+        for (i in 0 until numChunks) {
+            if (map[i] == 1.toByte()) {
+                val start = i * CHUNK_SIZE
+                total += min(CHUNK_SIZE, payloadLen - start)
+            }
+        }
+        return total
+    }
+
     /**
-     * Resumable chunked download (2 MB chunks).
-     * Flushes every chunk to disk; on any network drop, throws immediately while preserving
-     * every downloaded byte so Resume picks up from the exact byte with 0 wasted MBs.
+     * Multi-connection parallel chunked download (beats googlevideo per-socket throttling).
+     * Writes each 512 KB chunk directly to its exact file offset via thread-safe FileChannel.write,
+     * and persists a compact completion bitmap so Pause/Resume never re-downloads finished chunks.
      */
-    suspend fun download(
+    suspend fun downloadParallel(
         url: String,
         file: File,
+        doneFile: File,
         len: Long,
+        from: Long = 0L,
+        fileHeaderBytes: Long = 0L,
+        workers: Int = 4,
+        onBytes: (Long) -> Unit,
+    ) = withContext(Dispatchers.IO) {
+        if (len <= 0L) {
+            downloadSequential(url, file, from = if (file.exists()) file.length() else 0L, append = file.exists() && file.length() > 0L, onBytes = onBytes)
+            return@withContext
+        }
+        val payloadLen = len - from
+        if (payloadLen <= 0L) return@withContext
+
+        val numChunks = ((payloadLen + CHUNK_SIZE - 1) / CHUNK_SIZE).toInt()
+        val expectedFileLen = fileHeaderBytes + payloadLen
+        val done: ByteArray = if (
+            doneFile.exists() &&
+            doneFile.length() == numChunks.toLong() &&
+            file.exists() &&
+            file.length() == expectedFileLen
+        ) {
+            doneFile.readBytes()
+        } else {
+            RandomAccessFile(file, "rw").use { raf -> raf.setLength(expectedFileLen) }
+            ByteArray(numChunks).also { doneFile.writeBytes(it) }
+        }
+
+        val pending = (0 until numChunks).filter { done[it] == 0.toByte() }.toIntArray()
+        if (pending.isEmpty()) return@withContext
+
+        val cursor = AtomicInteger(0)
+        val doneLock = Any()
+
+        RandomAccessFile(file, "rw").use { raf ->
+            val channel = raf.channel
+            coroutineScope {
+                val nWorkers = min(workers, pending.size).coerceAtLeast(1)
+                repeat(nWorkers) {
+                    launch(Dispatchers.IO) {
+                        val ioBuf = ByteArray(64 * 1024)
+                        while (true) {
+                            ensureActive()
+                            val pIdx = cursor.getAndIncrement()
+                            if (pIdx >= pending.size) break
+                            val chunkIdx = pending[pIdx]
+                            val streamStart = from + chunkIdx * CHUNK_SIZE
+                            val streamEnd = min(streamStart + CHUNK_SIZE, len) - 1
+                            val expected = (streamEnd - streamStart + 1).toInt()
+                            val filePos = fileHeaderBytes + chunkIdx * CHUNK_SIZE
+
+                            val req = Request.Builder()
+                                .url(rangeUrl(url, streamStart, streamEnd))
+                                .header("User-Agent", UA)
+                                .build()
+
+                            val chunkData = ByteArray(expected)
+                            var filled = 0
+                            client.newCall(req).execute().use { r ->
+                                if (!r.isSuccessful) {
+                                    if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
+                                    throw IOException("HTTP ${r.code}")
+                                }
+                                val src = r.body!!.byteStream()
+                                while (filled < expected) {
+                                    val toRead = min(ioBuf.size, expected - filled)
+                                    val n = src.read(ioBuf, 0, toRead)
+                                    if (n < 0) break
+                                    ensureActive()
+                                    System.arraycopy(ioBuf, 0, chunkData, filled, n)
+                                    filled += n
+                                    onBytes(n.toLong())
+                                }
+                            }
+                            if (filled != expected) {
+                                throw IOException("Connection interrupted")
+                            }
+
+                            val bb = ByteBuffer.wrap(chunkData)
+                            var writePos = filePos
+                            while (bb.hasRemaining()) {
+                                val written = channel.write(bb, writePos)
+                                if (written <= 0) throw IOException("Disk write failed")
+                                writePos += written
+                            }
+
+                            synchronized(doneLock) {
+                                done[chunkIdx] = 1
+                                doneFile.writeBytes(done)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Fallback sequential download when total stream length is unknown. */
+    private suspend fun downloadSequential(
+        url: String,
+        file: File,
         from: Long = 0L,
         append: Boolean = false,
         onBytes: (Long) -> Unit,
     ) = withContext(Dispatchers.IO) {
-        val buf = ByteArray(32 * 1024)
-        var pos = from
-        var shouldAppend = append
-        val chunk = 2_000_000L
-
-        while (len <= 0L || pos < len) {
-            ensureActive()
-            val end = if (len > 0L) min(pos + chunk, len) - 1 else -1L
-            val reqBuilder = Request.Builder().header("User-Agent", UA)
-            if (len > 0L) {
-                reqBuilder.url(rangeUrl(url, pos, end))
-            } else {
-                reqBuilder.url(url)
-                if (pos > 0L) reqBuilder.header("Range", "bytes=$pos-")
+        val buf = ByteArray(64 * 1024)
+        val reqBuilder = Request.Builder().url(url).header("User-Agent", UA)
+        if (from > 0L) reqBuilder.header("Range", "bytes=$from-")
+        client.newCall(reqBuilder.build()).execute().use { r ->
+            if (!r.isSuccessful) {
+                if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
+                throw IOException("HTTP ${r.code}")
             }
-
-            client.newCall(reqBuilder.build()).execute().use { r ->
-                if (!r.isSuccessful) {
-                    if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
-                    throw IOException("HTTP ${r.code}")
-                }
-                val src = r.body!!.byteStream()
-                FileOutputStream(file, shouldAppend).buffered().use { out ->
-                    shouldAppend = true
-                    try {
-                        while (true) {
-                            val n = src.read(buf)
-                            if (n < 0) break
-                            ensureActive()
-                            out.write(buf, 0, n)
-                            pos += n
-                            onBytes(n.toLong())
-                        }
-                    } finally {
-                        runCatching { out.flush() }
+            val src = r.body!!.byteStream()
+            FileOutputStream(file, append).buffered().use { out ->
+                try {
+                    while (true) {
+                        val n = src.read(buf)
+                        if (n < 0) break
+                        ensureActive()
+                        out.write(buf, 0, n)
+                        onBytes(n.toLong())
                     }
+                } finally {
+                    runCatching { out.flush() }
                 }
             }
-            if (len <= 0L) break
         }
     }
 

@@ -13,6 +13,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -26,6 +28,8 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.SSLException
 
 private data class SavedReq(
@@ -227,7 +231,6 @@ object Engine {
                 }
                 throw e
             } catch (e: IOException) {
-                // Immediately pause and keep every downloaded byte on disk for Resume.
                 val p = job.value.progress
                 val reason = "Connection dropped. Progress saved — tap Resume to continue."
                 savePaused(req, p, reason)
@@ -259,11 +262,28 @@ object Engine {
         else -> e.message?.take(140) ?: "Something went wrong. Try again."
     }
 
-    private suspend fun run(info: VideoInfo, height: Int?, startSec: Long, work: File) {
+    private fun moveToFinal(src: File, dst: File) {
+        if (dst.exists()) dst.delete()
+        if (!src.renameTo(dst)) {
+            src.copyTo(dst, overwrite = true)
+            src.delete()
+        }
+    }
+
+    private suspend fun run(info: VideoInfo, height: Int?, startSec: Long, work: File) = coroutineScope {
         val plan = Extractor.plan(info, height, preferSplit = startSec > 0)
         val id = System.currentTimeMillis().toString(36)
         val ext = if (plan.video == null) "m4a" else "mp4"
         val out = File(dir, "$id.$ext")
+
+        // Fetch thumbnail in parallel so it adds zero latency at the end.
+        val thumbDeferred = async(Dispatchers.IO) {
+            info.thumb?.let { u ->
+                Net.bytes(u)?.let { b ->
+                    File(dir, "$id.jpg").also { it.writeBytes(b) }.name
+                }
+            }
+        }
 
         var partialOk = false
         if (startSec > 0) {
@@ -280,11 +300,7 @@ object Engine {
         }
         if (!partialOk) runFull(plan, startSec, work, out, ext)
 
-        val thumbName = info.thumb?.let { u ->
-            withContext(Dispatchers.IO) { Net.bytes(u) }?.let { b ->
-                File(dir, "$id.jpg").also { it.writeBytes(b) }.name
-            }
-        }
+        val thumbName = runCatching { thumbDeferred.await() }.getOrNull()
         val label = if (height == null) "Audio" else "${height}p"
         val item = DlItem(id, info.title, out.name, thumbName, label, out.length(), System.currentTimeMillis())
         items.update { listOf(item) + it }
@@ -292,50 +308,52 @@ object Engine {
         job.value = JobState(finished = true, title = info.title, progress = 1f)
     }
 
-    /** Downloads ONLY the data from the segment containing startSec onward, resuming saved bytes if paused. */
-    private suspend fun runPartial(plan: Plan, startSec: Long, work: File, out: File, ext: String): Boolean {
+    /** Downloads ONLY the data from startSec onward using parallel connections + chunk-exact resume. */
+    private suspend fun runPartial(plan: Plan, startSec: Long, work: File, out: File, ext: String): Boolean = coroutineScope {
         val metaFile = File(work, "partial_meta.json")
         val saved = runCatching { JSONObject(metaFile.readText()) }.getOrNull()
 
-        val vLen = saved?.optLong("vLen", 0L)?.takeIf { it > 0L }
-            ?: plan.video?.let { Net.length(it) } ?: 0L
-        val aLen = saved?.optLong("aLen", 0L)?.takeIf { it > 0L }
-            ?: plan.audio?.let { Net.length(it) } ?: 0L
+        val vLenJob = async { saved?.optLong("vLen", 0L)?.takeIf { it > 0L } ?: plan.video?.let { Net.length(it) } ?: 0L }
+        val aLenJob = async { saved?.optLong("aLen", 0L)?.takeIf { it > 0L } ?: plan.audio?.let { Net.length(it) } ?: 0L }
+        val vLen = vLenJob.await()
+        val aLen = aLenJob.await()
 
         val vFile = if (plan.video != null) File(work, "v.mp4") else null
         val aFile = if (plan.audio != null) File(work, "a.m4a") else null
+        val vDone = File(work, "v.done")
+        val aDone = File(work, "a.done")
 
-        val vOffset: Long
-        val vInitSize: Int
-        if (plan.video != null && vFile != null) {
+        val vSegJob = async {
+            if (plan.video == null || vFile == null) return@async 0L to 0
             val savedOff = saved?.optLong("vOff", -1L) ?: -1L
             val savedInit = saved?.optInt("vInit", -1) ?: -1
-            if (savedOff >= 0 && savedInit > 0 && vFile.exists() && vFile.length() >= savedInit) {
-                vOffset = savedOff; vInitSize = savedInit
+            if (savedOff >= 0 && savedInit > 0 && vFile.exists() && vFile.length() >= savedInit && vDone.exists()) {
+                savedOff to savedInit
             } else {
-                val seg = Net.findStart(plan.video, vLen, startSec) ?: return false
+                val seg = Net.findStart(plan.video, vLen, startSec) ?: return@async null
                 vFile.writeBytes(seg.init)
-                vOffset = seg.offset; vInitSize = seg.init.size
+                vDone.delete()
+                seg.offset to seg.init.size
             }
-        } else {
-            vOffset = 0L; vInitSize = 0
         }
-
-        val aOffset: Long
-        val aInitSize: Int
-        if (plan.audio != null && aFile != null) {
+        val aSegJob = async {
+            if (plan.audio == null || aFile == null) return@async 0L to 0
             val savedOff = saved?.optLong("aOff", -1L) ?: -1L
             val savedInit = saved?.optInt("aInit", -1) ?: -1
-            if (savedOff >= 0 && savedInit > 0 && aFile.exists() && aFile.length() >= savedInit) {
-                aOffset = savedOff; aInitSize = savedInit
+            if (savedOff >= 0 && savedInit > 0 && aFile.exists() && aFile.length() >= savedInit && aDone.exists()) {
+                savedOff to savedInit
             } else {
-                val seg = Net.findStart(plan.audio, aLen, startSec) ?: return false
+                val seg = Net.findStart(plan.audio, aLen, startSec) ?: return@async null
                 aFile.writeBytes(seg.init)
-                aOffset = seg.offset; aInitSize = seg.init.size
+                aDone.delete()
+                seg.offset to seg.init.size
             }
-        } else {
-            aOffset = 0L; aInitSize = 0
         }
+
+        val vPair = vSegJob.await() ?: return@coroutineScope false
+        val aPair = aSegJob.await() ?: return@coroutineScope false
+        val (vOffset, vInitSize) = vPair
+        val (aOffset, aInitSize) = aPair
 
         runCatching {
             metaFile.writeText(
@@ -347,77 +365,115 @@ object Engine {
             )
         }
 
-        val vNeed = if (plan.video != null) (vLen - vOffset + vInitSize).coerceAtLeast(0L) else 0L
-        val aNeed = if (plan.audio != null) (aLen - aOffset + aInitSize).coerceAtLeast(0L) else 0L
-        val total = (vNeed + aNeed).coerceAtLeast(1L)
-        var done = (vFile?.length() ?: 0L) + (aFile?.length() ?: 0L)
-        var lastPct = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
-        job.update { it.copy(progress = lastPct / 100f) }
+        val vPayload = if (plan.video != null) (vLen - vOffset).coerceAtLeast(0L) else 0L
+        val aPayload = if (plan.audio != null) (aLen - aOffset).coerceAtLeast(0L) else 0L
+        val total = (vPayload + aPayload).coerceAtLeast(1L)
+        val initialDone = Net.completedBytes(vDone, vPayload) + Net.completedBytes(aDone, aPayload)
+        val done = AtomicLong(initialDone)
+        val lastPct = AtomicInteger(((initialDone.toFloat() / total).coerceIn(0f, 1f) * 90).toInt())
+        job.update {
+            it.copy(
+                phase = if (plan.video == null) "Downloading audio from your start" else "Downloading from your start",
+                progress = lastPct.get() / 100f,
+            )
+        }
 
-        suspend fun grab(url: String, offset: Long, initSize: Int, len: Long, f: File, label: String) {
-            val alreadyBody = (f.length() - initSize).coerceAtLeast(0L)
-            val resumeFrom = offset + alreadyBody
-            if (len > 0L && resumeFrom >= len) return
-            job.update { it.copy(phase = label) }
-            Net.download(url, f, len, from = resumeFrom, append = true) { n ->
-                done += n
-                val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
-                if (p != lastPct) { lastPct = p; job.update { it.copy(progress = p / 100f) } }
+        fun onBytes(n: Long) {
+            val cur = done.addAndGet(n)
+            val p = ((cur.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
+            if (p != lastPct.getAndSet(p)) {
+                job.update { it.copy(progress = p / 100f) }
             }
         }
 
-        if (plan.video != null && vFile != null) grab(plan.video, vOffset, vInitSize, vLen, vFile, "Downloading video from your start")
-        if (plan.audio != null && aFile != null) grab(plan.audio, aOffset, aInitSize, aLen, aFile, "Downloading audio from your start")
+        coroutineScope {
+            if (plan.video != null && vFile != null) {
+                launch {
+                    Net.downloadParallel(
+                        url = plan.video, file = vFile, doneFile = vDone, len = vLen,
+                        from = vOffset, fileHeaderBytes = vInitSize.toLong(), workers = 4, onBytes = ::onBytes,
+                    )
+                }
+            }
+            if (plan.audio != null && aFile != null) {
+                launch {
+                    Net.downloadParallel(
+                        url = plan.audio, file = aFile, doneFile = aDone, len = aLen,
+                        from = aOffset, fileHeaderBytes = aInitSize.toLong(), workers = 2, onBytes = ::onBytes,
+                    )
+                }
+            }
+        }
 
         job.update { it.copy(phase = if (vFile != null && aFile != null) "Merging" else "Finalizing", progress = 0.9f) }
         val tmp = File(work, "out.$ext")
         remux(vFile, aFile, 0L, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
-        tmp.copyTo(out, overwrite = true)
-        return true
+        moveToFinal(tmp, out)
+        true
     }
 
-    /** Full download with byte-exact resume across pauses/network drops, then trim/merge. */
-    private suspend fun runFull(plan: Plan, startSec: Long, work: File, out: File, ext: String) {
+    /** Full download using multi-connection parallel chunks + chunk-exact resume. */
+    private suspend fun runFull(plan: Plan, startSec: Long, work: File, out: File, ext: String) = coroutineScope {
         val partialMeta = File(work, "partial_meta.json")
         if (partialMeta.exists()) {
             work.deleteRecursively(); work.mkdirs()
         }
         val vFile = plan.video?.let { File(work, "v.mp4") }
         val aFile = plan.audio?.let { File(work, "a.m4a") }
-        val vLen = plan.video?.let { Net.length(it) } ?: 0L
-        val aLen = plan.audio?.let { Net.length(it) } ?: 0L
+        val vDone = File(work, "v.done")
+        val aDone = File(work, "a.done")
+
+        val vLenJob = async { plan.video?.let { Net.length(it) } ?: 0L }
+        val aLenJob = async { plan.audio?.let { Net.length(it) } ?: 0L }
+        val vLen = vLenJob.await()
+        val aLen = aLenJob.await()
         val total = (vLen + aLen).coerceAtLeast(1L)
 
-        if (vFile != null && vFile.exists() && vLen > 0L && vFile.length() > vLen) vFile.delete()
-        if (aFile != null && aFile.exists() && aLen > 0L && aFile.length() > aLen) aFile.delete()
+        val initialDone = Net.completedBytes(vDone, vLen) + Net.completedBytes(aDone, aLen)
+        val done = AtomicLong(initialDone)
+        val lastPct = AtomicInteger(((initialDone.toFloat() / total).coerceIn(0f, 1f) * 90).toInt())
+        job.update {
+            it.copy(
+                phase = if (plan.video == null) "Downloading audio" else "Downloading video",
+                progress = lastPct.get() / 100f,
+            )
+        }
 
-        var done = (vFile?.length() ?: 0L) + (aFile?.length() ?: 0L)
-        var lastPct = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
-        job.update { it.copy(progress = lastPct / 100f) }
-
-        suspend fun grab(url: String, f: File, len: Long, label: String) {
-            val existing = if (f.exists()) f.length() else 0L
-            if (len > 0L && existing >= len) return
-            job.update { it.copy(phase = label) }
-            Net.download(url, f, len, from = existing, append = existing > 0L) { n ->
-                done += n
-                val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
-                if (p != lastPct) { lastPct = p; job.update { it.copy(progress = p / 100f) } }
+        fun onBytes(n: Long) {
+            val cur = done.addAndGet(n)
+            val p = ((cur.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
+            if (p != lastPct.getAndSet(p)) {
+                job.update { it.copy(progress = p / 100f) }
             }
         }
 
-        if (plan.video != null && vFile != null) grab(plan.video, vFile, vLen, "Downloading video")
-        if (plan.audio != null && aFile != null) {
-            grab(plan.audio, aFile, aLen, if (plan.video == null) "Downloading audio" else "Downloading audio track")
+        coroutineScope {
+            if (plan.video != null && vFile != null) {
+                launch {
+                    Net.downloadParallel(
+                        url = plan.video, file = vFile, doneFile = vDone, len = vLen,
+                        from = 0L, fileHeaderBytes = 0L, workers = 4, onBytes = ::onBytes,
+                    )
+                }
+            }
+            if (plan.audio != null && aFile != null) {
+                launch {
+                    Net.downloadParallel(
+                        url = plan.audio, file = aFile, doneFile = aDone, len = aLen,
+                        from = 0L, fileHeaderBytes = 0L, workers = 2, onBytes = ::onBytes,
+                    )
+                }
+            }
         }
+
         val needTransform = (vFile != null && aFile != null) || startSec > 0
         if (needTransform) {
             job.update { it.copy(phase = if (startSec > 0) "Trimming and merging" else "Merging", progress = 0.9f) }
             val tmp = File(work, "out.$ext")
             remux(vFile, aFile, startSec * 1000, tmp) { p -> job.update { it.copy(progress = 0.9f + 0.1f * p) } }
-            tmp.copyTo(out, overwrite = true)
+            moveToFinal(tmp, out)
         } else {
-            (vFile ?: aFile)!!.copyTo(out, overwrite = true)
+            moveToFinal((vFile ?: aFile)!!, out)
         }
     }
 
@@ -429,7 +485,7 @@ object Engine {
 
     /**
      * Copies (never re-encodes) the video/audio samples into one MP4, starting from the
-     * keyframe at or before startMs. Runs off the main thread and is cancellable.
+     * keyframe at or before startMs. Uses direct ByteBuffer for fast zero-copy remuxing.
      */
     private suspend fun remux(
         video: File?, audio: File?, startMs: Long, out: File, onProgress: (Float) -> Unit,
@@ -437,7 +493,7 @@ object Engine {
         class T(val ex: MediaExtractor) {
             val outIdx = HashMap<Int, Int>()
             var isVideo = false
-            var maxSize = 4 shl 20
+            var maxSize = 2 shl 20
         }
 
         val extractors = mutableListOf<MediaExtractor>()
@@ -505,7 +561,7 @@ object Engine {
             val originUs = sources.map { it.ex.sampleTime }.filter { it >= 0L }.minOrNull() ?: 0L
 
             muxer.start(); started = true
-            val buf = ByteBuffer.allocate(sources.maxOf { it.maxSize })
+            val buf = ByteBuffer.allocateDirect(sources.maxOf { it.maxSize })
             val bi = MediaCodec.BufferInfo()
             val total = (durationUs - originUs).coerceAtLeast(1L)
             val lastPtsByTrack = HashMap<Int, Long>()
