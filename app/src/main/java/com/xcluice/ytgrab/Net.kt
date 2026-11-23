@@ -1,7 +1,6 @@
 package com.xcluice.ytgrab
 
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -19,10 +18,9 @@ object Net {
     const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
     val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(25, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -33,18 +31,14 @@ object Net {
 
     suspend fun length(url: String): Long = withContext(Dispatchers.IO) {
         Regex("[?&]clen=(\\d+)").find(url)?.groupValues?.get(1)?.toLongOrNull()?.let { return@withContext it }
-        repeat(3) { attempt ->
-            try {
-                val req = Request.Builder().url(url).header("User-Agent", UA).header("Range", "bytes=0-0").build()
-                client.newCall(req).execute().use { r ->
-                    val len = r.header("Content-Range")?.substringAfter('/')?.toLongOrNull()
-                    if (len != null && len > 0) return@withContext len
-                }
-            } catch (_: Exception) {
-                if (attempt < 2) delay(1500L * (attempt + 1))
+        try {
+            val req = Request.Builder().url(url).header("User-Agent", UA).header("Range", "bytes=0-0").build()
+            client.newCall(req).execute().use { r ->
+                r.header("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: 0L
             }
+        } catch (_: Exception) {
+            0L
         }
-        0L
     }
 
     fun bytes(url: String): ByteArray? = try {
@@ -54,9 +48,9 @@ object Net {
     }
 
     /**
-     * YouTube-style resilient chunked download:
-     * - Uses 2 MB chunks to survive slow/unstable mobile connections.
-     * - Automatically retries from the exact last written byte on network drops (0 wasted MBs).
+     * Resumable chunked download (2 MB chunks).
+     * Flushes every chunk to disk; on any network drop, throws immediately while preserving
+     * every downloaded byte so Resume picks up from the exact byte with 0 wasted MBs.
      */
     suspend fun download(
         url: String,
@@ -64,65 +58,48 @@ object Net {
         len: Long,
         from: Long = 0L,
         append: Boolean = false,
-        onRetry: (Boolean) -> Unit = {},
         onBytes: (Long) -> Unit,
     ) = withContext(Dispatchers.IO) {
         val buf = ByteArray(32 * 1024)
         var pos = from
         var shouldAppend = append
         val chunk = 2_000_000L
-        var consecutiveErrors = 0
-        val maxRetries = 12
 
         while (len <= 0L || pos < len) {
             ensureActive()
-            try {
-                val end = if (len > 0L) min(pos + chunk, len) - 1 else -1L
-                val reqBuilder = Request.Builder().header("User-Agent", UA)
-                if (len > 0L) {
-                    reqBuilder.url(rangeUrl(url, pos, end))
-                } else {
-                    reqBuilder.url(url)
-                    if (pos > 0L) reqBuilder.header("Range", "bytes=$pos-")
-                }
+            val end = if (len > 0L) min(pos + chunk, len) - 1 else -1L
+            val reqBuilder = Request.Builder().header("User-Agent", UA)
+            if (len > 0L) {
+                reqBuilder.url(rangeUrl(url, pos, end))
+            } else {
+                reqBuilder.url(url)
+                if (pos > 0L) reqBuilder.header("Range", "bytes=$pos-")
+            }
 
-                client.newCall(reqBuilder.build()).execute().use { r ->
-                    if (!r.isSuccessful) {
-                        if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
-                        throw IOException("HTTP ${r.code}")
-                    }
-                    val src = r.body!!.byteStream()
-                    FileOutputStream(file, shouldAppend).buffered().use { out ->
-                        shouldAppend = true
+            client.newCall(reqBuilder.build()).execute().use { r ->
+                if (!r.isSuccessful) {
+                    if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
+                    throw IOException("HTTP ${r.code}")
+                }
+                val src = r.body!!.byteStream()
+                FileOutputStream(file, shouldAppend).buffered().use { out ->
+                    shouldAppend = true
+                    try {
                         while (true) {
                             val n = src.read(buf)
                             if (n < 0) break
                             ensureActive()
                             out.write(buf, 0, n)
                             pos += n
-                            if (consecutiveErrors > 0) {
-                                consecutiveErrors = 0
-                                onRetry(false)
-                            }
                             onBytes(n.toLong())
                         }
-                        out.flush()
+                    } finally {
+                        runCatching { out.flush() }
                     }
                 }
-                // Unknown total length finished cleanly.
-                if (len <= 0L) break
-            } catch (e: HttpStatusException) {
-                throw e
-            } catch (e: IOException) {
-                ensureActive()
-                consecutiveErrors++
-                if (consecutiveErrors > maxRetries) throw e
-                onRetry(true)
-                val waitMs = min(1500L * consecutiveErrors, 8000L)
-                delay(waitMs)
             }
+            if (len <= 0L) break
         }
-        onRetry(false)
     }
 
     class Seg(val init: ByteArray, val offset: Long)
@@ -134,22 +111,11 @@ object Net {
     suspend fun findStart(url: String, len: Long, startSec: Long): Seg? = withContext(Dispatchers.IO) {
         if (len <= 0) return@withContext null
         val headLen = min(len, 600_000L)
-        var head: ByteArray? = null
-        var lastErr: IOException? = null
-        repeat(4) { attempt ->
-            try {
-                val req = Request.Builder().url(rangeUrl(url, 0, headLen - 1)).header("User-Agent", UA).build()
-                head = client.newCall(req).execute().use { r ->
-                    if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
-                    r.body!!.bytes()
-                }
-                return@repeat
-            } catch (e: IOException) {
-                lastErr = e
-                if (attempt < 3) delay(1500L * (attempt + 1))
-            }
+        val req = Request.Builder().url(rangeUrl(url, 0, headLen - 1)).header("User-Agent", UA).build()
+        val bytes = client.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+            r.body!!.bytes()
         }
-        val bytes = head ?: throw (lastErr ?: IOException("Couldn't read video index"))
         try {
             val bb = ByteBuffer.wrap(bytes)
             var pos = 0L

@@ -28,7 +28,14 @@ import java.net.UnknownHostException
 import java.nio.ByteBuffer
 import javax.net.ssl.SSLException
 
-private data class Req(val info: VideoInfo, val height: Int?, val startSec: Long)
+private data class SavedReq(
+    val url: String,
+    val title: String,
+    val thumb: String?,
+    val height: Int?,
+    val startSec: Long,
+    val info: VideoInfo? = null,
+)
 
 object Engine {
     lateinit var app: Application
@@ -36,7 +43,7 @@ object Engine {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var running: Job? = null
-    private var lastReq: Req? = null
+    private var lastReq: SavedReq? = null
     private var pausing = false
 
     val job = MutableStateFlow(JobState())
@@ -45,18 +52,40 @@ object Engine {
     val dir: File
         get() = File(app.filesDir, "videos").apply {
             mkdirs()
-            runCatching { File(this, ".nomedia").createNewFile() }\n        }
+            runCatching { File(this, ".nomedia").createNewFile() }
+        }
 
     private val index get() = File(dir, "index.json")
+    private val pausedFile get() = File(dir, "paused.json")
 
-    private fun partialDir(info: VideoInfo, height: Int?, startSec: Long): File {
-        val key = "${info.url}|${height ?: 0}|$startSec".hashCode().toUInt().toString(16)
-        return File(app.cacheDir, "partial_$key")
+    private fun partialDir(url: String, height: Int?, startSec: Long): File {
+        val key = "$url|${height ?: 0}|$startSec".hashCode().toUInt().toString(16)
+        return File(app.filesDir, "partial_$key")
     }
 
     private fun cleanOtherPartials(keep: File?) {
-        app.cacheDir.listFiles()?.filter { it.name.startsWith("partial_") && it != keep }
+        app.filesDir.listFiles()?.filter { it.name.startsWith("partial_") && it != keep }
             ?.forEach { it.deleteRecursively() }
+    }
+
+    private fun savePaused(req: SavedReq, progress: Float, reason: String?) {
+        runCatching {
+            pausedFile.writeText(
+                JSONObject()
+                    .put("url", req.url)
+                    .put("title", req.title)
+                    .put("thumb", req.thumb ?: "")
+                    .put("height", req.height ?: 0)
+                    .put("startSec", req.startSec)
+                    .put("progress", progress.toDouble())
+                    .put("reason", reason ?: "")
+                    .toString()
+            )
+        }
+    }
+
+    private fun clearPaused() {
+        runCatching { pausedFile.delete() }
     }
 
     fun init(application: Application) {
@@ -72,6 +101,34 @@ object Engine {
                 )
             }.filter { File(dir, it.file).exists() }
         }.getOrDefault(emptyList())
+
+        // Restore any paused download from disk so user can Resume even after closing the app.
+        runCatching {
+            if (pausedFile.exists()) {
+                val o = JSONObject(pausedFile.readText())
+                val url = o.getString("url")
+                val title = o.getString("title")
+                val thumb = o.optString("thumb").ifEmpty { null }
+                val h = o.optInt("height", 0).takeIf { it > 0 }
+                val startSec = o.optLong("startSec", 0L)
+                val progress = o.optDouble("progress", 0.0).toFloat()
+                val reason = o.optString("reason").ifEmpty { null }
+                val work = partialDir(url, h, startSec)
+                if (work.exists()) {
+                    lastReq = SavedReq(url, title, thumb, h, startSec, info = null)
+                    job.value = JobState(
+                        active = false,
+                        paused = true,
+                        title = title,
+                        phase = "Paused — progress saved",
+                        progress = progress,
+                        error = reason,
+                    )
+                } else {
+                    clearPaused()
+                }
+            }
+        }
     }
 
     private fun save() {
@@ -92,7 +149,10 @@ object Engine {
 
     fun ack() {
         if (!job.value.active) {
-            if (!job.value.paused) lastReq = null
+            if (!job.value.paused) {
+                lastReq = null
+                clearPaused()
+            }
             job.value = JobState()
         }
     }
@@ -106,37 +166,52 @@ object Engine {
     fun cancel() {
         pausing = false
         running?.cancel()
-        lastReq?.let { partialDir(it.info, it.height, it.startSec).deleteRecursively() }
+        lastReq?.let { partialDir(it.url, it.height, it.startSec).deleteRecursively() }
         lastReq = null
+        clearPaused()
         job.value = JobState()
     }
 
     fun resume() {
         val r = lastReq ?: return
-        start(r.info, r.height, r.startSec, refreshUrls = true)
+        launchReq(r, refreshUrls = true)
     }
 
-    fun start(info: VideoInfo, height: Int?, startSec: Long, refreshUrls: Boolean = false) {
+    fun start(info: VideoInfo, height: Int?, startSec: Long) {
+        val req = SavedReq(info.url, info.title, info.thumb, height, startSec, info = info)
+        launchReq(req, refreshUrls = false)
+    }
+
+    private fun launchReq(req: SavedReq, refreshUrls: Boolean) {
         if (job.value.active) return
         pausing = false
-        val work = partialDir(info, height, startSec).apply { mkdirs() }
+        val work = partialDir(req.url, req.height, req.startSec).apply { mkdirs() }
         cleanOtherPartials(keep = work)
-        lastReq = Req(info, height, startSec)
-        val prevProgress = if (job.value.paused && job.value.title == info.title) job.value.progress else 0f
-        job.value = JobState(active = true, title = info.title, phase = if (prevProgress > 0f) "Resuming" else "Starting", progress = prevProgress)
+        lastReq = req
+        val prevProgress = if (job.value.paused && job.value.title == req.title) job.value.progress else 0f
+        job.value = JobState(
+            active = true,
+            title = req.title,
+            phase = if (prevProgress > 0f) "Resuming" else "Starting",
+            progress = prevProgress,
+        )
         runCatching { ContextCompat.startForegroundService(app, Intent(app, DownloadService::class.java)) }
         running = scope.launch {
             try {
-                val activeInfo = if (refreshUrls) {
-                    runCatching { Extractor.fetch(info.url) }.getOrDefault(info)
-                } else info
-                lastReq = Req(activeInfo, height, startSec)
-                run(activeInfo, height, startSec, work)
+                val activeInfo = if (refreshUrls || req.info == null) {
+                    Extractor.fetch(req.url)
+                } else req.info
+                val updated = req.copy(info = activeInfo)
+                lastReq = updated
+                run(activeInfo, req.height, req.startSec, work)
                 work.deleteRecursively()
+                clearPaused()
                 lastReq = null
             } catch (e: CancellationException) {
                 if (pausing) {
                     pausing = false
+                    val p = job.value.progress
+                    savePaused(req, p, null)
                     job.update {
                         it.copy(
                             active = false,
@@ -147,21 +222,26 @@ object Engine {
                     }
                 } else {
                     work.deleteRecursively()
+                    clearPaused()
                     job.value = JobState()
                 }
                 throw e
             } catch (e: IOException) {
-                // Keep all downloaded bytes on disk so Resume picks up from the exact byte!
+                // Immediately pause and keep every downloaded byte on disk for Resume.
+                val p = job.value.progress
+                val reason = "Connection dropped. Progress saved — tap Resume to continue."
+                savePaused(req, p, reason)
                 job.update {
                     it.copy(
                         active = false,
                         paused = true,
                         phase = "Paused — low network",
-                        error = "Connection dropped. Your progress is saved — tap Resume to continue.",
+                        error = reason,
                     )
                 }
             } catch (e: Throwable) {
                 work.deleteRecursively()
+                clearPaused()
                 lastReq = null
                 job.value = JobState(error = friendly(e))
             }
@@ -193,7 +273,6 @@ object Engine {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: IOException) {
-                // Never swallow network errors into a full re-download!
                 throw e
             } catch (_: Exception) {
                 false
@@ -213,7 +292,7 @@ object Engine {
         job.value = JobState(finished = true, title = info.title, progress = 1f)
     }
 
-    /** Downloads ONLY the data from the segment containing startSec onward, resuming saved bytes if interrupted. */
+    /** Downloads ONLY the data from the segment containing startSec onward, resuming saved bytes if paused. */
     private suspend fun runPartial(plan: Plan, startSec: Long, work: File, out: File, ext: String): Boolean {
         val metaFile = File(work, "partial_meta.json")
         val saved = runCatching { JSONObject(metaFile.readText()) }.getOrNull()
@@ -280,12 +359,7 @@ object Engine {
             val resumeFrom = offset + alreadyBody
             if (len > 0L && resumeFrom >= len) return
             job.update { it.copy(phase = label) }
-            Net.download(
-                url, f, len, from = resumeFrom, append = true,
-                onRetry = { retrying ->
-                    job.update { it.copy(phase = if (retrying) "Low network — retrying…" else label) }
-                },
-            ) { n ->
+            Net.download(url, f, len, from = resumeFrom, append = true) { n ->
                 done += n
                 val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
                 if (p != lastPct) { lastPct = p; job.update { it.copy(progress = p / 100f) } }
@@ -302,9 +376,8 @@ object Engine {
         return true
     }
 
-    /** Full download with byte-exact resume across network drops, then trim/merge. */
+    /** Full download with byte-exact resume across pauses/network drops, then trim/merge. */
     private suspend fun runFull(plan: Plan, startSec: Long, work: File, out: File, ext: String) {
-        // Clear partial_meta if we fell back from a broken partial attempt.
         val partialMeta = File(work, "partial_meta.json")
         if (partialMeta.exists()) {
             work.deleteRecursively(); work.mkdirs()
@@ -315,7 +388,6 @@ object Engine {
         val aLen = plan.audio?.let { Net.length(it) } ?: 0L
         val total = (vLen + aLen).coerceAtLeast(1L)
 
-        // If a saved file somehow exceeds vLen/aLen, reset it; otherwise resume from exact length.
         if (vFile != null && vFile.exists() && vLen > 0L && vFile.length() > vLen) vFile.delete()
         if (aFile != null && aFile.exists() && aLen > 0L && aFile.length() > aLen) aFile.delete()
 
@@ -327,12 +399,7 @@ object Engine {
             val existing = if (f.exists()) f.length() else 0L
             if (len > 0L && existing >= len) return
             job.update { it.copy(phase = label) }
-            Net.download(
-                url, f, len, from = existing, append = existing > 0L,
-                onRetry = { retrying ->
-                    job.update { it.copy(phase = if (retrying) "Low network — retrying…" else label) }
-                },
-            ) { n ->
+            Net.download(url, f, len, from = existing, append = existing > 0L) { n ->
                 done += n
                 val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
                 if (p != lastPct) { lastPct = p; job.update { it.copy(progress = p / 100f) } }
