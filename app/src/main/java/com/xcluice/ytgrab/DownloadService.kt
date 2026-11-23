@@ -70,6 +70,7 @@ class DownloadService : Service() {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     when {
                         s.finished -> result("Download complete", s.title)
+                        s.paused -> result("Download paused", "Progress saved — open Ytgrab to resume")
                         s.error != null -> result("Download failed", s.error)
                     }
                     stopSelf()

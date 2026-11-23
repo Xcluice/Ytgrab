@@ -26,6 +26,7 @@ data class DlItem(
 
 data class JobState(
     val active: Boolean = false,
+    val paused: Boolean = false,
     val title: String = "",
     val phase: String = "",
     val progress: Float = 0f,

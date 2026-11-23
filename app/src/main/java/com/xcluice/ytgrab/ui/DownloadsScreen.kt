@@ -64,23 +64,35 @@ fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
             Header("Downloads")
             Spacer(Modifier.height(18.dp))
 
-            if (items.isEmpty() && !job.active) {
+            if (items.isEmpty() && !job.active && !job.paused) {
                 Empty(onGoHome)
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 120.dp)) {
-                    if (job.active) item(key = "active") {
+                    if (job.active || job.paused) item(key = "active") {
                         Row(
                             Modifier.fillMaxWidth().animateItem().clip(RoundedCornerShape(22.dp)).background(C.Surface).padding(16.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Box(contentAlignment = Alignment.Center) {
-                                Ring(job.progress, 56.dp)
-                                Text("${(job.progress * 100).toInt()}", fontSize = 13.sp, color = C.Teal, fontWeight = FontWeight.SemiBold)
+                                Ring(job.progress, 56.dp, color = if (job.paused) C.Muted else C.Teal)
+                                Text(
+                                    "${(job.progress * 100).toInt()}",
+                                    fontSize = 13.sp,
+                                    color = if (job.paused) C.Muted else C.Teal,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
                             }
                             Spacer(Modifier.width(16.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(job.title, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 Text(job.phase, fontSize = 13.sp, color = C.Muted, modifier = Modifier.padding(top = 4.dp))
+                            }
+                            if (job.paused) {
+                                Box(
+                                    Modifier.pressable { Engine.resume() }.clip(RoundedCornerShape(10.dp)).background(C.Teal)
+                                        .padding(horizontal = 12.dp, vertical = 7.dp)
+                                ) { Text("Resume", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+                                Spacer(Modifier.width(6.dp))
                             }
                             Box(Modifier.pressable { Engine.cancel() }.padding(8.dp)) { Glyph(G.Close, C.Muted, 20.dp) }
                         }

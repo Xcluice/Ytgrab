@@ -230,6 +230,7 @@ fun HomeScreen(vm: HomeVM, onGoDownloads: () -> Unit) {
 
         val kind = when {
             job.active -> 1
+            job.paused -> 4
             job.finished -> 2
             job.error != null -> 3
             else -> 0
@@ -246,10 +247,40 @@ fun HomeScreen(vm: HomeVM, onGoDownloads: () -> Unit) {
                     Spacer(Modifier.height(14.dp))
                     Bar(job.progress)
                     Spacer(Modifier.height(16.dp))
-                    Box(
-                        Modifier.pressable { Engine.cancel() }.clip(RoundedCornerShape(12.dp)).background(C.Surface2)
-                            .padding(horizontal = 16.dp, vertical = 9.dp)
-                    ) { Text("Cancel", color = C.Muted, fontSize = 14.sp) }
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Box(
+                            Modifier.pressable { Engine.pause() }.clip(RoundedCornerShape(12.dp)).background(C.Surface2)
+                                .padding(horizontal = 16.dp, vertical = 9.dp)
+                        ) { Text("Pause", color = C.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium) }
+                        Box(
+                            Modifier.pressable { Engine.cancel() }.clip(RoundedCornerShape(12.dp)).background(C.Surface2)
+                                .padding(horizontal = 16.dp, vertical = 9.dp)
+                        ) { Text("Cancel", color = C.Muted, fontSize = 14.sp) }
+                    }
+                }
+                4 -> Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(C.Surface).padding(18.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(job.phase, fontSize = 14.sp, color = C.Text, fontWeight = FontWeight.Medium)
+                        Text("${(job.progress * 100).toInt()}%", fontSize = 14.sp, color = C.Muted, fontWeight = FontWeight.SemiBold)
+                    }
+                    if (!job.error.isNullOrBlank()) {
+                        Text(job.error!!, fontSize = 13.sp, color = C.Muted, modifier = Modifier.padding(top = 6.dp))
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Bar(job.progress, color = C.Muted)
+                    Spacer(Modifier.height(16.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Box(
+                            Modifier.weight(1f).pressable { Engine.resume() }.clip(RoundedCornerShape(14.dp)).background(C.Teal)
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center,
+                        ) { Text("Resume", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+                        Box(
+                            Modifier.pressable { Engine.cancel() }.clip(RoundedCornerShape(14.dp)).background(C.Surface2)
+                                .padding(horizontal = 18.dp, vertical = 12.dp),
+                            contentAlignment = Alignment.Center,
+                        ) { Text("Cancel", color = C.Muted, fontSize = 14.sp) }
+                    }
                 }
                 2 -> Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(C.Surface).padding(18.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {

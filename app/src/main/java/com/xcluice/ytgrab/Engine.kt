@@ -6,6 +6,7 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.os.Build
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -27,12 +28,16 @@ import java.net.UnknownHostException
 import java.nio.ByteBuffer
 import javax.net.ssl.SSLException
 
+private data class Req(val info: VideoInfo, val height: Int?, val startSec: Long)
+
 object Engine {
     lateinit var app: Application
         private set
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var running: Job? = null
+    private var lastReq: Req? = null
+    private var pausing = false
 
     val job = MutableStateFlow(JobState())
     val items = MutableStateFlow<List<DlItem>>(emptyList())
@@ -40,10 +45,19 @@ object Engine {
     val dir: File
         get() = File(app.filesDir, "videos").apply {
             mkdirs()
-            runCatching { File(this, ".nomedia").createNewFile() }
-        }
+            runCatching { File(this, ".nomedia").createNewFile() }\n        }
 
     private val index get() = File(dir, "index.json")
+
+    private fun partialDir(info: VideoInfo, height: Int?, startSec: Long): File {
+        val key = "${info.url}|${height ?: 0}|$startSec".hashCode().toUInt().toString(16)
+        return File(app.cacheDir, "partial_$key")
+    }
+
+    private fun cleanOtherPartials(keep: File?) {
+        app.cacheDir.listFiles()?.filter { it.name.startsWith("partial_") && it != keep }
+            ?.forEach { it.deleteRecursively() }
+    }
 
     fun init(application: Application) {
         app = application
@@ -77,28 +91,79 @@ object Engine {
     }
 
     fun ack() {
-        if (!job.value.active) job.value = JobState()
+        if (!job.value.active) {
+            if (!job.value.paused) lastReq = null
+            job.value = JobState()
+        }
     }
 
-    fun cancel() {
+    fun pause() {
+        if (!job.value.active) return
+        pausing = true
         running?.cancel()
     }
 
-    fun start(info: VideoInfo, height: Int?, startSec: Long) {
+    fun cancel() {
+        pausing = false
+        running?.cancel()
+        lastReq?.let { partialDir(it.info, it.height, it.startSec).deleteRecursively() }
+        lastReq = null
+        job.value = JobState()
+    }
+
+    fun resume() {
+        val r = lastReq ?: return
+        start(r.info, r.height, r.startSec, refreshUrls = true)
+    }
+
+    fun start(info: VideoInfo, height: Int?, startSec: Long, refreshUrls: Boolean = false) {
         if (job.value.active) return
-        job.value = JobState(active = true, title = info.title, phase = "Starting")
+        pausing = false
+        val work = partialDir(info, height, startSec).apply { mkdirs() }
+        cleanOtherPartials(keep = work)
+        lastReq = Req(info, height, startSec)
+        val prevProgress = if (job.value.paused && job.value.title == info.title) job.value.progress else 0f
+        job.value = JobState(active = true, title = info.title, phase = if (prevProgress > 0f) "Resuming" else "Starting", progress = prevProgress)
         runCatching { ContextCompat.startForegroundService(app, Intent(app, DownloadService::class.java)) }
         running = scope.launch {
-            val work = File(app.cacheDir, "work")
             try {
-                run(info, height, startSec, work)
-            } catch (e: CancellationException) {
-                job.value = JobState()
-                throw e
-            } catch (e: Throwable) {
-                job.value = JobState(error = friendly(e))
-            } finally {
+                val activeInfo = if (refreshUrls) {
+                    runCatching { Extractor.fetch(info.url) }.getOrDefault(info)
+                } else info
+                lastReq = Req(activeInfo, height, startSec)
+                run(activeInfo, height, startSec, work)
                 work.deleteRecursively()
+                lastReq = null
+            } catch (e: CancellationException) {
+                if (pausing) {
+                    pausing = false
+                    job.update {
+                        it.copy(
+                            active = false,
+                            paused = true,
+                            phase = "Paused — progress saved",
+                            error = null,
+                        )
+                    }
+                } else {
+                    work.deleteRecursively()
+                    job.value = JobState()
+                }
+                throw e
+            } catch (e: IOException) {
+                // Keep all downloaded bytes on disk so Resume picks up from the exact byte!
+                job.update {
+                    it.copy(
+                        active = false,
+                        paused = true,
+                        phase = "Paused — low network",
+                        error = "Connection dropped. Your progress is saved — tap Resume to continue.",
+                    )
+                }
+            } catch (e: Throwable) {
+                work.deleteRecursively()
+                lastReq = null
+                job.value = JobState(error = friendly(e))
             }
         }
     }
@@ -115,7 +180,6 @@ object Engine {
     }
 
     private suspend fun run(info: VideoInfo, height: Int?, startSec: Long, work: File) {
-        work.deleteRecursively(); work.mkdirs()
         val plan = Extractor.plan(info, height, preferSplit = startSec > 0)
         val id = System.currentTimeMillis().toString(36)
         val ext = if (plan.video == null) "m4a" else "mp4"
@@ -128,7 +192,10 @@ object Engine {
                 runPartial(plan, startSec, work, out, ext)
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: Exception) {
+            } catch (e: IOException) {
+                // Never swallow network errors into a full re-download!
+                throw e
+            } catch (_: Exception) {
                 false
             }
         }
@@ -146,34 +213,87 @@ object Engine {
         job.value = JobState(finished = true, title = info.title, progress = 1f)
     }
 
-    /** Downloads ONLY the data from the segment containing startSec onward. */
+    /** Downloads ONLY the data from the segment containing startSec onward, resuming saved bytes if interrupted. */
     private suspend fun runPartial(plan: Plan, startSec: Long, work: File, out: File, ext: String): Boolean {
-        val vLen = plan.video?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
-        val aLen = plan.audio?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
-        val vSeg = plan.video?.let { Net.findStart(it, vLen, startSec) ?: return false }
-        val aSeg = plan.audio?.let { Net.findStart(it, aLen, startSec) ?: return false }
-        val vNeed = if (vSeg != null) vLen - vSeg.offset + vSeg.init.size else 0L
-        val aNeed = if (aSeg != null) aLen - aSeg.offset + aSeg.init.size else 0L
-        val total = (vNeed + aNeed).coerceAtLeast(1L)
-        var done = 0L
+        val metaFile = File(work, "partial_meta.json")
+        val saved = runCatching { JSONObject(metaFile.readText()) }.getOrNull()
 
-        suspend fun grab(url: String, seg: Net.Seg, len: Long, f: File, label: String) {
+        val vLen = saved?.optLong("vLen", 0L)?.takeIf { it > 0L }
+            ?: plan.video?.let { Net.length(it) } ?: 0L
+        val aLen = saved?.optLong("aLen", 0L)?.takeIf { it > 0L }
+            ?: plan.audio?.let { Net.length(it) } ?: 0L
+
+        val vFile = if (plan.video != null) File(work, "v.mp4") else null
+        val aFile = if (plan.audio != null) File(work, "a.m4a") else null
+
+        val vOffset: Long
+        val vInitSize: Int
+        if (plan.video != null && vFile != null) {
+            val savedOff = saved?.optLong("vOff", -1L) ?: -1L
+            val savedInit = saved?.optInt("vInit", -1) ?: -1
+            if (savedOff >= 0 && savedInit > 0 && vFile.exists() && vFile.length() >= savedInit) {
+                vOffset = savedOff; vInitSize = savedInit
+            } else {
+                val seg = Net.findStart(plan.video, vLen, startSec) ?: return false
+                vFile.writeBytes(seg.init)
+                vOffset = seg.offset; vInitSize = seg.init.size
+            }
+        } else {
+            vOffset = 0L; vInitSize = 0
+        }
+
+        val aOffset: Long
+        val aInitSize: Int
+        if (plan.audio != null && aFile != null) {
+            val savedOff = saved?.optLong("aOff", -1L) ?: -1L
+            val savedInit = saved?.optInt("aInit", -1) ?: -1
+            if (savedOff >= 0 && savedInit > 0 && aFile.exists() && aFile.length() >= savedInit) {
+                aOffset = savedOff; aInitSize = savedInit
+            } else {
+                val seg = Net.findStart(plan.audio, aLen, startSec) ?: return false
+                aFile.writeBytes(seg.init)
+                aOffset = seg.offset; aInitSize = seg.init.size
+            }
+        } else {
+            aOffset = 0L; aInitSize = 0
+        }
+
+        runCatching {
+            metaFile.writeText(
+                JSONObject()
+                    .put("vLen", vLen).put("aLen", aLen)
+                    .put("vOff", vOffset).put("vInit", vInitSize)
+                    .put("aOff", aOffset).put("aInit", aInitSize)
+                    .toString()
+            )
+        }
+
+        val vNeed = if (plan.video != null) (vLen - vOffset + vInitSize).coerceAtLeast(0L) else 0L
+        val aNeed = if (plan.audio != null) (aLen - aOffset + aInitSize).coerceAtLeast(0L) else 0L
+        val total = (vNeed + aNeed).coerceAtLeast(1L)
+        var done = (vFile?.length() ?: 0L) + (aFile?.length() ?: 0L)
+        var lastPct = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
+        job.update { it.copy(progress = lastPct / 100f) }
+
+        suspend fun grab(url: String, offset: Long, initSize: Int, len: Long, f: File, label: String) {
+            val alreadyBody = (f.length() - initSize).coerceAtLeast(0L)
+            val resumeFrom = offset + alreadyBody
+            if (len > 0L && resumeFrom >= len) return
             job.update { it.copy(phase = label) }
-            f.writeBytes(seg.init)
-            done += seg.init.size
-            var last = -1
-            Net.download(url, f, len, from = seg.offset, append = true) { n ->
+            Net.download(
+                url, f, len, from = resumeFrom, append = true,
+                onRetry = { retrying ->
+                    job.update { it.copy(phase = if (retrying) "Low network — retrying…" else label) }
+                },
+            ) { n ->
                 done += n
                 val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
-                if (p != last) { last = p; job.update { it.copy(progress = p / 100f) } }
+                if (p != lastPct) { lastPct = p; job.update { it.copy(progress = p / 100f) } }
             }
         }
-        val vFile = if (plan.video != null && vSeg != null) File(work, "v.mp4").also {
-            grab(plan.video, vSeg, vLen, it, "Downloading video from your start")
-        } else null
-        val aFile = if (plan.audio != null && aSeg != null) File(work, "a.m4a").also {
-            grab(plan.audio, aSeg, aLen, it, "Downloading audio from your start")
-        } else null
+
+        if (plan.video != null && vFile != null) grab(plan.video, vOffset, vInitSize, vLen, vFile, "Downloading video from your start")
+        if (plan.audio != null && aFile != null) grab(plan.audio, aOffset, aInitSize, aLen, aFile, "Downloading audio from your start")
 
         job.update { it.copy(phase = if (vFile != null && aFile != null) "Merging" else "Finalizing", progress = 0.9f) }
         val tmp = File(work, "out.$ext")
@@ -182,25 +302,43 @@ object Engine {
         return true
     }
 
-    /** Fallback: download everything, then cut from startSec. */
+    /** Full download with byte-exact resume across network drops, then trim/merge. */
     private suspend fun runFull(plan: Plan, startSec: Long, work: File, out: File, ext: String) {
-        work.deleteRecursively(); work.mkdirs()
+        // Clear partial_meta if we fell back from a broken partial attempt.
+        val partialMeta = File(work, "partial_meta.json")
+        if (partialMeta.exists()) {
+            work.deleteRecursively(); work.mkdirs()
+        }
         val vFile = plan.video?.let { File(work, "v.mp4") }
         val aFile = plan.audio?.let { File(work, "a.m4a") }
-        val vLen = plan.video?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
-        val aLen = plan.audio?.let { withContext(Dispatchers.IO) { Net.length(it) } } ?: 0L
+        val vLen = plan.video?.let { Net.length(it) } ?: 0L
+        val aLen = plan.audio?.let { Net.length(it) } ?: 0L
         val total = (vLen + aLen).coerceAtLeast(1L)
-        var done = 0L
+
+        // If a saved file somehow exceeds vLen/aLen, reset it; otherwise resume from exact length.
+        if (vFile != null && vFile.exists() && vLen > 0L && vFile.length() > vLen) vFile.delete()
+        if (aFile != null && aFile.exists() && aLen > 0L && aFile.length() > aLen) aFile.delete()
+
+        var done = (vFile?.length() ?: 0L) + (aFile?.length() ?: 0L)
+        var lastPct = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
+        job.update { it.copy(progress = lastPct / 100f) }
 
         suspend fun grab(url: String, f: File, len: Long, label: String) {
-            job.update { it.copy(phase = label, progress = 0f) }
-            var last = -1
-            Net.download(url, f, len) { n ->
+            val existing = if (f.exists()) f.length() else 0L
+            if (len > 0L && existing >= len) return
+            job.update { it.copy(phase = label) }
+            Net.download(
+                url, f, len, from = existing, append = existing > 0L,
+                onRetry = { retrying ->
+                    job.update { it.copy(phase = if (retrying) "Low network — retrying…" else label) }
+                },
+            ) { n ->
                 done += n
                 val p = ((done.toFloat() / total).coerceIn(0f, 1f) * 90).toInt()
-                if (p != last) { last = p; job.update { it.copy(progress = p / 100f) } }
+                if (p != lastPct) { lastPct = p; job.update { it.copy(progress = p / 100f) } }
             }
         }
+
         if (plan.video != null && vFile != null) grab(plan.video, vFile, vLen, "Downloading video")
         if (plan.audio != null && aFile != null) {
             grab(plan.audio, aFile, aLen, if (plan.video == null) "Downloading audio" else "Downloading audio track")
@@ -286,7 +424,6 @@ object Engine {
                 } else startUs
                 sources.filter { it !== v }.forEach { it.ex.seekTo(seekTarget, MediaExtractor.SEEK_TO_CLOSEST_SYNC) }
             } else if (v != null && sources.size > 1) {
-                // Partial DASH downloads can start at slightly different segment times; align audio to video.
                 val vStart = v.ex.sampleTime
                 if (vStart > 0L) {
                     sources.filter { it !== v }.forEach { a ->
@@ -298,17 +435,17 @@ object Engine {
                 }
             }
 
-            // Re-base so the output always starts at 0 (ignoring tracks already at EOF).
             val originUs = sources.map { it.ex.sampleTime }.filter { it >= 0L }.minOrNull() ?: 0L
 
             muxer.start(); started = true
             val buf = ByteBuffer.allocate(sources.maxOf { it.maxSize })
             val bi = MediaCodec.BufferInfo()
             val total = (durationUs - originUs).coerceAtLeast(1L)
+            val lastPtsByTrack = HashMap<Int, Long>()
+            val monotonicFix = Build.VERSION.SDK_INT < 29
             var lastPct = -1
             while (true) {
                 ensureActive()
-                // Interleave: always write from the source whose next sample is earliest.
                 var next: T? = null
                 var nextT = Long.MAX_VALUE
                 for (t in sources) {
@@ -321,8 +458,15 @@ object Engine {
                 buf.clear()
                 val n = t.ex.readSampleData(buf, 0)
                 if (n < 0) { t.ex.advance(); continue }
+                val rawPts = (nextT - originUs).coerceAtLeast(0L)
+                val pts = if (monotonicFix) {
+                    val prev = lastPtsByTrack[dst]
+                    val fixed = if (prev != null && rawPts <= prev) prev + 1L else rawPts
+                    lastPtsByTrack[dst] = fixed
+                    fixed
+                } else rawPts
                 bi.set(
-                    0, n, (nextT - originUs).coerceAtLeast(0L),
+                    0, n, pts,
                     if (t.ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0,
                 )
                 muxer.writeSampleData(dst, buf, bi)
