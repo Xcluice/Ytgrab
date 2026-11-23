@@ -7,6 +7,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.Build
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -15,6 +16,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -28,6 +30,7 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.nio.ByteBuffer
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.SSLException
@@ -70,6 +73,12 @@ object Engine {
     private fun cleanOtherPartials(keep: File?) {
         app.filesDir.listFiles()?.filter { it.name.startsWith("partial_") && it != keep }
             ?.forEach { it.deleteRecursively() }
+    }
+
+    private fun fmtSpeed(bps: Long): String = when {
+        bps >= 1_048_576L -> String.format(Locale.US, "%.1f MB/s", bps / 1_048_576.0)
+        bps >= 1024L -> "${bps / 1024L} KB/s"
+        else -> ""
     }
 
     private fun savePaused(req: SavedReq, progress: Float, reason: String?) {
@@ -221,6 +230,7 @@ object Engine {
                             active = false,
                             paused = true,
                             phase = "Paused — progress saved",
+                            speed = "",
                             error = null,
                         )
                     }
@@ -239,6 +249,7 @@ object Engine {
                         active = false,
                         paused = true,
                         phase = "Paused — low network",
+                        speed = "",
                         error = reason,
                     )
                 }
@@ -276,7 +287,6 @@ object Engine {
         val ext = if (plan.video == null) "m4a" else "mp4"
         val out = File(dir, "$id.$ext")
 
-        // Fetch thumbnail in parallel so it adds zero latency at the end.
         val thumbDeferred = async(Dispatchers.IO) {
             info.thumb?.let { u ->
                 Net.bytes(u)?.let { b ->
@@ -308,7 +318,30 @@ object Engine {
         job.value = JobState(finished = true, title = info.title, progress = 1f)
     }
 
-    /** Downloads ONLY the data from startSec onward using parallel connections + chunk-exact resume. */
+    private suspend fun trackSpeed(done: AtomicLong, block: suspend () -> Unit) = coroutineScope {
+        val meter = launch {
+            var prevBytes = done.get()
+            var prevTime = SystemClock.elapsedRealtime()
+            while (true) {
+                delay(700)
+                val now = SystemClock.elapsedRealtime()
+                val curBytes = done.get()
+                val dt = (now - prevTime).coerceAtLeast(1L)
+                val bps = ((curBytes - prevBytes) * 1000L) / dt
+                prevBytes = curBytes
+                prevTime = now
+                job.update { it.copy(speed = fmtSpeed(bps)) }
+            }
+        }
+        try {
+            block()
+        } finally {
+            meter.cancel()
+            job.update { it.copy(speed = "") }
+        }
+    }
+
+    /** Downloads ONLY the data from startSec onward using parallel HTTP/1.1 sockets + chunk-exact resume. */
     private suspend fun runPartial(plan: Plan, startSec: Long, work: File, out: File, ext: String): Boolean = coroutineScope {
         val metaFile = File(work, "partial_meta.json")
         val saved = runCatching { JSONObject(metaFile.readText()) }.getOrNull()
@@ -386,21 +419,24 @@ object Engine {
             }
         }
 
-        coroutineScope {
-            if (plan.video != null && vFile != null) {
-                launch {
-                    Net.downloadParallel(
-                        url = plan.video, file = vFile, doneFile = vDone, len = vLen,
-                        from = vOffset, fileHeaderBytes = vInitSize.toLong(), workers = 4, onBytes = ::onBytes,
-                    )
+        trackSpeed(done) {
+            coroutineScope {
+                if (plan.video != null && vFile != null) {
+                    launch {
+                        Net.downloadParallel(
+                            url = plan.video, file = vFile, doneFile = vDone, len = vLen,
+                            from = vOffset, fileHeaderBytes = vInitSize.toLong(), workers = 6, onBytes = ::onBytes,
+                        )
+                    }
                 }
-            }
-            if (plan.audio != null && aFile != null) {
-                launch {
-                    Net.downloadParallel(
-                        url = plan.audio, file = aFile, doneFile = aDone, len = aLen,
-                        from = aOffset, fileHeaderBytes = aInitSize.toLong(), workers = 2, onBytes = ::onBytes,
-                    )
+                if (plan.audio != null && aFile != null) {
+                    launch {
+                        Net.downloadParallel(
+                            url = plan.audio, file = aFile, doneFile = aDone, len = aLen,
+                            from = aOffset, fileHeaderBytes = aInitSize.toLong(),
+                            workers = if (plan.video == null) 6 else 2, onBytes = ::onBytes,
+                        )
+                    }
                 }
             }
         }
@@ -412,7 +448,7 @@ object Engine {
         true
     }
 
-    /** Full download using multi-connection parallel chunks + chunk-exact resume. */
+    /** Full download using multi-socket HTTP/1.1 parallel chunks + chunk-exact resume. */
     private suspend fun runFull(plan: Plan, startSec: Long, work: File, out: File, ext: String) = coroutineScope {
         val partialMeta = File(work, "partial_meta.json")
         if (partialMeta.exists()) {
@@ -447,21 +483,24 @@ object Engine {
             }
         }
 
-        coroutineScope {
-            if (plan.video != null && vFile != null) {
-                launch {
-                    Net.downloadParallel(
-                        url = plan.video, file = vFile, doneFile = vDone, len = vLen,
-                        from = 0L, fileHeaderBytes = 0L, workers = 4, onBytes = ::onBytes,
-                    )
+        trackSpeed(done) {
+            coroutineScope {
+                if (plan.video != null && vFile != null) {
+                    launch {
+                        Net.downloadParallel(
+                            url = plan.video, file = vFile, doneFile = vDone, len = vLen,
+                            from = 0L, fileHeaderBytes = 0L, workers = 6, onBytes = ::onBytes,
+                        )
+                    }
                 }
-            }
-            if (plan.audio != null && aFile != null) {
-                launch {
-                    Net.downloadParallel(
-                        url = plan.audio, file = aFile, doneFile = aDone, len = aLen,
-                        from = 0L, fileHeaderBytes = 0L, workers = 2, onBytes = ::onBytes,
-                    )
+                if (plan.audio != null && aFile != null) {
+                    launch {
+                        Net.downloadParallel(
+                            url = plan.audio, file = aFile, doneFile = aDone, len = aLen,
+                            from = 0L, fileHeaderBytes = 0L,
+                            workers = if (plan.video == null) 6 else 2, onBytes = ::onBytes,
+                        )
+                    }
                 }
             }
         }

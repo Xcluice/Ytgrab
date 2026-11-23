@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
@@ -22,23 +23,36 @@ class HttpStatusException(val code: Int) : IOException("HTTP $code")
 
 object Net {
     const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
-    const val CHUNK_SIZE = 524_288L // 512 KB chunks: fast parallel throughput + fine-grained resume
+    const val CHUNK_SIZE = 2_097_152L // 2 MB chunks: saturates TCP window without hitting YT 10 MB throttle cliff
 
     val client: OkHttpClient = OkHttpClient.Builder()
-        .dispatcher(Dispatcher().apply {
-            maxRequests = 16
-            maxRequestsPerHost = 8
-        })
-        .connectionPool(ConnectionPool(8, 2, TimeUnit.MINUTES))
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(25, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
-    private fun rangeUrl(url: String, start: Long, end: Long): String {
+    /**
+     * Dedicated HTTP/1.1 download client so parallel workers open genuinely separate TCP sockets
+     * to googlevideo.com instead of multiplexing onto a single throttled HTTP/2 connection.
+     */
+    private val dlClient: OkHttpClient = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 20
+            maxRequestsPerHost = 12
+        })
+        .connectionPool(ConnectionPool(12, 2, TimeUnit.MINUTES))
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    private fun rangeUrl(url: String, start: Long, end: Long, rn: Int? = null): String {
         val sep = if ('?' in url) '&' else '?'
-        return "$url${sep}range=$start-$end"
+        val base = "$url${sep}range=$start-$end"
+        return if (rn != null && !url.contains("rn=")) "$base&rn=$rn" else base
     }
 
     suspend fun length(url: String): Long = withContext(Dispatchers.IO) {
@@ -76,9 +90,9 @@ object Net {
     }
 
     /**
-     * Multi-connection parallel chunked download (beats googlevideo per-socket throttling).
-     * Writes each 512 KB chunk directly to its exact file offset via thread-safe FileChannel.write,
-     * and persists a compact completion bitmap so Pause/Resume never re-downloads finished chunks.
+     * High-speed multi-socket HTTP/1.1 parallel chunked downloader.
+     * Streams 64 KB blocks straight to FileChannel (tiny RAM footprint on Oreo) and marks each
+     * finished 2 MB chunk with a single-byte write in doneFile for instant, zero-waste Resume.
      */
     suspend fun downloadParallel(
         url: String,
@@ -87,7 +101,7 @@ object Net {
         len: Long,
         from: Long = 0L,
         fileHeaderBytes: Long = 0L,
-        workers: Int = 4,
+        workers: Int = 6,
         onBytes: (Long) -> Unit,
     ) = withContext(Dispatchers.IO) {
         if (len <= 0L) {
@@ -115,63 +129,64 @@ object Net {
         if (pending.isEmpty()) return@withContext
 
         val cursor = AtomicInteger(0)
+        val rnCounter = AtomicInteger(1)
         val doneLock = Any()
 
         RandomAccessFile(file, "rw").use { raf ->
-            val channel = raf.channel
-            coroutineScope {
-                val nWorkers = min(workers, pending.size).coerceAtLeast(1)
-                repeat(nWorkers) {
-                    launch(Dispatchers.IO) {
-                        val ioBuf = ByteArray(64 * 1024)
-                        while (true) {
-                            ensureActive()
-                            val pIdx = cursor.getAndIncrement()
-                            if (pIdx >= pending.size) break
-                            val chunkIdx = pending[pIdx]
-                            val streamStart = from + chunkIdx * CHUNK_SIZE
-                            val streamEnd = min(streamStart + CHUNK_SIZE, len) - 1
-                            val expected = (streamEnd - streamStart + 1).toInt()
-                            val filePos = fileHeaderBytes + chunkIdx * CHUNK_SIZE
+            RandomAccessFile(doneFile, "rw").use { doneRaf ->
+                val channel = raf.channel
+                coroutineScope {
+                    val nWorkers = min(workers, pending.size).coerceAtLeast(1)
+                    repeat(nWorkers) {
+                        launch(Dispatchers.IO) {
+                            val ioBuf = ByteArray(64 * 1024)
+                            while (true) {
+                                ensureActive()
+                                val pIdx = cursor.getAndIncrement()
+                                if (pIdx >= pending.size) break
+                                val chunkIdx = pending[pIdx]
+                                val streamStart = from + chunkIdx * CHUNK_SIZE
+                                val streamEnd = min(streamStart + CHUNK_SIZE, len) - 1
+                                val expected = streamEnd - streamStart + 1
+                                var writePos = fileHeaderBytes + chunkIdx * CHUNK_SIZE
 
-                            val req = Request.Builder()
-                                .url(rangeUrl(url, streamStart, streamEnd))
-                                .header("User-Agent", UA)
-                                .build()
+                                val req = Request.Builder()
+                                    .url(rangeUrl(url, streamStart, streamEnd, rn = rnCounter.getAndIncrement()))
+                                    .header("User-Agent", UA)
+                                    .header("Connection", "keep-alive")
+                                    .build()
 
-                            val chunkData = ByteArray(expected)
-                            var filled = 0
-                            client.newCall(req).execute().use { r ->
-                                if (!r.isSuccessful) {
-                                    if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
-                                    throw IOException("HTTP ${r.code}")
+                                var writtenTotal = 0L
+                                dlClient.newCall(req).execute().use { r ->
+                                    if (!r.isSuccessful) {
+                                        if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
+                                        throw IOException("HTTP ${r.code}")
+                                    }
+                                    val src = r.body!!.byteStream()
+                                    while (writtenTotal < expected) {
+                                        val toRead = min(ioBuf.size.toLong(), expected - writtenTotal).toInt()
+                                        val n = src.read(ioBuf, 0, toRead)
+                                        if (n < 0) break
+                                        ensureActive()
+                                        val bb = ByteBuffer.wrap(ioBuf, 0, n)
+                                        while (bb.hasRemaining()) {
+                                            val w = channel.write(bb, writePos)
+                                            if (w <= 0) throw IOException("Disk write failed")
+                                            writePos += w
+                                        }
+                                        writtenTotal += n
+                                        onBytes(n.toLong())
+                                    }
                                 }
-                                val src = r.body!!.byteStream()
-                                while (filled < expected) {
-                                    val toRead = min(ioBuf.size, expected - filled)
-                                    val n = src.read(ioBuf, 0, toRead)
-                                    if (n < 0) break
-                                    ensureActive()
-                                    System.arraycopy(ioBuf, 0, chunkData, filled, n)
-                                    filled += n
-                                    onBytes(n.toLong())
+                                if (writtenTotal != expected) {
+                                    throw IOException("Connection interrupted")
                                 }
-                            }
-                            if (filled != expected) {
-                                throw IOException("Connection interrupted")
-                            }
 
-                            val bb = ByteBuffer.wrap(chunkData)
-                            var writePos = filePos
-                            while (bb.hasRemaining()) {
-                                val written = channel.write(bb, writePos)
-                                if (written <= 0) throw IOException("Disk write failed")
-                                writePos += written
-                            }
-
-                            synchronized(doneLock) {
-                                done[chunkIdx] = 1
-                                doneFile.writeBytes(done)
+                                synchronized(doneLock) {
+                                    done[chunkIdx] = 1
+                                    doneRaf.seek(chunkIdx.toLong())
+                                    doneRaf.write(1)
+                                }
                             }
                         }
                     }
@@ -191,7 +206,7 @@ object Net {
         val buf = ByteArray(64 * 1024)
         val reqBuilder = Request.Builder().url(url).header("User-Agent", UA)
         if (from > 0L) reqBuilder.header("Range", "bytes=$from-")
-        client.newCall(reqBuilder.build()).execute().use { r ->
+        dlClient.newCall(reqBuilder.build()).execute().use { r ->
             if (!r.isSuccessful) {
                 if (r.code in listOf(403, 404, 410)) throw HttpStatusException(r.code)
                 throw IOException("HTTP ${r.code}")

@@ -29,6 +29,7 @@ data class JobState(
     val paused: Boolean = false,
     val title: String = "",
     val phase: String = "",
+    val speed: String = "",
     val progress: Float = 0f,
     val finished: Boolean = false,
     val error: String? = null,

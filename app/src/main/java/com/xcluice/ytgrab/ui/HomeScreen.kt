@@ -240,9 +240,10 @@ fun HomeScreen(vm: HomeVM, onGoDownloads: () -> Unit) {
         }, label = "action") { k ->
             when (k) {
                 1 -> Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(C.Surface).padding(18.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Text(job.phase, fontSize = 14.sp, color = C.Text, fontWeight = FontWeight.Medium)
-                        Text("${(job.progress * 100).toInt()}%", fontSize = 14.sp, color = C.Teal, fontWeight = FontWeight.SemiBold)
+                        val right = if (job.speed.isNotEmpty()) "${job.speed}  •  ${(job.progress * 100).toInt()}%" else "${(job.progress * 100).toInt()}%"
+                        Text(right, fontSize = 14.sp, color = C.Teal, fontWeight = FontWeight.SemiBold)
                     }
                     Spacer(Modifier.height(14.dp))
                     Bar(job.progress)
