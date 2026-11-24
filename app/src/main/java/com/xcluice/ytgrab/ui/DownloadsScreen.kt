@@ -1,5 +1,11 @@
 package com.xcluice.ytgrab.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
@@ -35,18 +41,22 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.xcluice.ytgrab.DlItem
 import com.xcluice.ytgrab.Engine
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
 
@@ -57,7 +67,46 @@ private fun size(b: Long): String =
 fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
     val items by Engine.items.collectAsState()
     val job by Engine.job.collectAsState()
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     var confirm by remember { mutableStateOf<DlItem?>(null) }
+    var pendingExport by remember { mutableStateOf<DlItem?>(null) }
+    var exportingId by remember { mutableStateOf<String?>(null) }
+
+    fun doExport(item: DlItem) {
+        if (exportingId != null) return
+        exportingId = item.id
+        scope.launch {
+            val res = Engine.exportToGallery(ctx, item)
+            exportingId = null
+            Toast.makeText(
+                ctx,
+                res.getOrElse { "Couldn't save to Gallery: ${it.message ?: "error"}" },
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val item = pendingExport
+        pendingExport = null
+        if (granted && item != null) {
+            doExport(item)
+        } else if (!granted) {
+            Toast.makeText(ctx, "Storage permission needed to save to Gallery", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun requestExport(item: DlItem) {
+        if (Build.VERSION.SDK_INT < 29 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingExport = item
+            permLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            doExport(item)
+        }
+    }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
@@ -103,20 +152,27 @@ fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
                                 .pressable { onPlay(item) }.padding(12.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Thumb(item.id, Modifier.size(112.dp, 70.dp).clip(RoundedCornerShape(14.dp))) {
+                            Thumb(item.id, Modifier.size(104.dp, 66.dp).clip(RoundedCornerShape(14.dp))) {
                                 item.thumb?.let { runCatching { File(Engine.dir, it).readBytes() }.getOrNull() }
                             }
-                            Spacer(Modifier.width(14.dp))
+                            Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(item.title, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 Text("${item.label}  ${size(item.bytes)}", fontSize = 13.sp, color = C.Muted, modifier = Modifier.padding(top = 4.dp))
                             }
                             Spacer(Modifier.width(8.dp))
                             Box(
-                                Modifier.pressable { confirm = item }.size(42.dp).clip(RoundedCornerShape(21.dp))
+                                Modifier.pressable(enabled = exportingId != item.id) { requestExport(item) }
+                                    .size(38.dp).clip(RoundedCornerShape(19.dp))
+                                    .background(C.Teal.copy(alpha = .16f)),
+                                contentAlignment = Alignment.Center,
+                            ) { Glyph(G.Gallery, C.Teal, 19.dp) }
+                            Spacer(Modifier.width(8.dp))
+                            Box(
+                                Modifier.pressable { confirm = item }.size(38.dp).clip(RoundedCornerShape(19.dp))
                                     .background(C.Red.copy(alpha = .16f)),
                                 contentAlignment = Alignment.Center,
-                            ) { Glyph(G.Trash, C.Red, 20.dp) }
+                            ) { Glyph(G.Trash, C.Red, 19.dp) }
                         }
                     }
                 }

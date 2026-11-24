@@ -1,13 +1,18 @@
 package com.xcluice.ytgrab
 
 import android.app.Application
+import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.media.MediaScannerConnection
 import android.os.Build
+import android.os.Environment
 import android.os.SystemClock
+import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -158,6 +163,59 @@ object Engine {
         item.thumb?.let { File(dir, it).delete() }
         items.update { l -> l.filter { it.id != item.id } }
         save()
+    }
+
+    /** Copies a private download into public Movies/Ytgrab (or Music/Ytgrab) so it appears in Gallery. */
+    suspend fun exportToGallery(ctx: Context, item: DlItem): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val src = File(dir, item.file)
+            if (!src.exists()) error("File not found")
+            val isAudio = item.label == "Audio"
+            val ext = if (isAudio) "m4a" else "mp4"
+            val mime = if (isAudio) "audio/mp4" else "video/mp4"
+            val safeName = item.title
+                .replace(Regex("[^a-zA-Z0-9._ -]"), "")
+                .trim()
+                .take(60)
+                .ifEmpty { "Ytgrab_${item.id}" }
+            val displayName = "$safeName.$ext"
+
+            if (Build.VERSION.SDK_INT >= 29) {
+                val relDir = (if (isAudio) Environment.DIRECTORY_MUSIC else Environment.DIRECTORY_MOVIES) + "/Ytgrab"
+                val collection = if (isAudio) MediaStore.Audio.Media.EXTERNAL_CONTENT_URI else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, relDir)
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val resolver = ctx.contentResolver
+                val uri = resolver.insert(collection, values) ?: error("Couldn't create gallery entry")
+                try {
+                    resolver.openOutputStream(uri)?.use { out ->
+                        src.inputStream().use { inp -> inp.copyTo(out, 64 * 1024) }
+                    } ?: error("Couldn't write gallery file")
+                    values.clear()
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                } catch (e: Throwable) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    throw e
+                }
+                if (isAudio) "Saved to Music/Ytgrab" else "Saved to Gallery"
+            } else {
+                @Suppress("DEPRECATION")
+                val pubRoot = Environment.getExternalStoragePublicDirectory(
+                    if (isAudio) Environment.DIRECTORY_MUSIC else Environment.DIRECTORY_MOVIES
+                )
+                val outDir = File(pubRoot, "Ytgrab").apply { mkdirs() }
+                var dst = File(outDir, displayName)
+                if (dst.exists()) dst = File(outDir, "${safeName}_${item.id}.$ext")
+                src.copyTo(dst, overwrite = true)
+                MediaScannerConnection.scanFile(ctx, arrayOf(dst.absolutePath), arrayOf(mime), null)
+                if (isAudio) "Saved to Music/Ytgrab" else "Saved to Gallery"
+            }
+        }
     }
 
     fun ack() {

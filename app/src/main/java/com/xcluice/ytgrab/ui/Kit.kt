@@ -116,7 +116,7 @@ fun Modifier.pressable(enabled: Boolean = true, onClick: () -> Unit): Modifier =
         .clickable(interactionSource = src, indication = null, enabled = enabled, onClick = onClick)
 }
 
-enum class G { Home, Down, Trash, Paste, Close, Play, Check }
+enum class G { Home, Down, Trash, Paste, Close, Play, Check, Gallery }
 
 @Composable
 fun Glyph(g: G, tint: Color, size: Dp = 22.dp, strokeDp: Float = 2f) {
@@ -151,6 +151,13 @@ fun Glyph(g: G, tint: Color, size: Dp = 22.dp, strokeDp: Float = 2f) {
                 m(.3f, .2f); l(.3f, .8f); l(.8f, .5f); close()
             }, tint, style = Fill)
             G.Check -> drawPath(Path().apply { m(.18f, .52f); l(.42f, .74f); l(.82f, .28f) }, tint, style = st)
+            G.Gallery -> {
+                drawRoundRect(tint, Offset(.14f * w, .18f * w), Size(.72f * w, .64f * w), CornerRadius(.12f * w), style = st)
+                drawCircle(tint, .065f * w, Offset(.65f * w, .36f * w))
+                drawPath(Path().apply {
+                    m(.22f, .72f); l(.42f, .48f); l(.58f, .64f); l(.7f, .52f); l(.82f, .72f)
+                }, tint, style = st)
+            }
         }
     }
 }

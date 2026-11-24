@@ -1,13 +1,19 @@
 package com.xcluice.ytgrab.ui
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.view.TextureView
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -18,6 +24,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -31,6 +38,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -44,6 +52,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -67,6 +76,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -82,6 +92,7 @@ import com.xcluice.ytgrab.DlItem
 import com.xcluice.ytgrab.Engine
 import com.xcluice.ytgrab.Ts
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
 
@@ -184,7 +195,41 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
     val ctx = LocalContext.current
     val activity = remember(ctx) { ctx.findActivity() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val scope = rememberCoroutineScope()
     val isAudioOnly = item.label == "Audio"
+
+    var savedToGallery by remember(item.id) { mutableStateOf(false) }
+    var savingGallery by remember(item.id) { mutableStateOf(false) }
+
+    fun doExport() {
+        if (savingGallery) return
+        savingGallery = true
+        scope.launch {
+            val res = Engine.exportToGallery(ctx, item)
+            savingGallery = false
+            if (res.isSuccess) savedToGallery = true
+            Toast.makeText(
+                ctx,
+                res.getOrElse { "Couldn't save to Gallery: ${it.message ?: "error"}" },
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) doExport()
+        else Toast.makeText(ctx, "Storage permission needed to save to Gallery", Toast.LENGTH_SHORT).show()
+    }
+
+    fun requestExport() {
+        if (Build.VERSION.SDK_INT < 29 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            permLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            doExport()
+        }
+    }
 
     val player = remember(item.id) {
         ExoPlayer.Builder(ctx).build().apply {
@@ -228,7 +273,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
         seekBadge = (if (deltaMs < 0) -1 else 1) to ((seekBadge?.second ?: 0) + 1)
     }
 
-    // Listen to ExoPlayer state and exact original video dimensions.
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -256,7 +300,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
         }
     }
 
-    // Pause when app moves to background.
     DisposableEffect(lifecycle, player) {
         val obs = LifecycleEventObserver { _, ev ->
             if (ev == Lifecycle.Event.ON_PAUSE) player.pause()
@@ -265,7 +308,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
         onDispose { lifecycle.removeObserver(obs) }
     }
 
-    // Keep screen awake while playing.
     DisposableEffect(activity, playing) {
         val win = activity?.window
         if (playing) win?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -273,7 +315,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
         onDispose { win?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
     }
 
-    // Manage fullscreen orientation and system bars cleanly.
     DisposableEffect(activity, fullscreen, videoRatio) {
         val win = activity?.window
         if (activity != null && win != null) {
@@ -299,7 +340,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
         }
     }
 
-    // Poll playback position smoothly.
     LaunchedEffect(player) {
         while (true) {
             if (!dragging) {
@@ -310,7 +350,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
         }
     }
 
-    // Auto-hide controls after 3s while playing.
     LaunchedEffect(controls, controlsToken, playing, dragging, showSpeeds) {
         if (controls && playing && !dragging && !showSpeeds) {
             delay(3000)
@@ -318,7 +357,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
         }
     }
 
-    // Clear double-tap seek indicator after 650ms.
     LaunchedEffect(seekBadge) {
         if (seekBadge != null) {
             delay(650)
@@ -337,7 +375,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
     val shownMs = if (dragging) dragMs else posMs
     val progress = if (durMs > 0L) (shownMs.toFloat() / durMs.toFloat()).coerceIn(0f, 1f) else 0f
 
-    // Single reusable TextureView preserved across portrait/fullscreen transitions (reliable on Android 8.0 Oreo).
     val videoSurface = remember(player) {
         movableContentOf<Modifier> { surfaceModifier ->
             AndroidView(
@@ -377,7 +414,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                 }
                 Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .45f)))
             } else {
-                // Render the video in its exact original YouTube aspect ratio without cropping or stretching.
                 BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     val ratio = videoRatio.coerceIn(0.25f, 4f)
                     val boxRatio = if (maxHeight.value > 0f) maxWidth.value / maxHeight.value else 16f / 9f
@@ -390,7 +426,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                 }
             }
 
-            // Double-tap -10s / +10s YouTube feedback pill.
             AnimatedVisibility(
                 seekBadge != null,
                 enter = fadeIn(tween(120)) + scaleIn(initialScale = .85f),
@@ -414,7 +449,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                 }
             }
 
-            // Controls overlay.
             AnimatedVisibility(
                 controls,
                 enter = fadeIn(tween(180)),
@@ -434,7 +468,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                             )
                         )
                 ) {
-                    // Top bar: back, title, speed, mute, loop.
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -496,7 +529,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                         ) { PIcon(PI.Loop, if (loop) C.Red else Color.White.copy(alpha = .78f), 20.dp) }
                     }
 
-                    // Center YouTube transport controls: -10s, Play/Pause/Replay, +10s.
                     Row(
                         Modifier.align(Alignment.Center),
                         horizontalArrangement = Arrangement.spacedBy(32.dp),
@@ -551,7 +583,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                         ) { PIcon(PI.Fwd10, Color.White, 22.dp) }
                     }
 
-                    // Bottom bar: timestamps, fullscreen button, and red YouTube scrubber.
                     Column(
                         Modifier
                             .fillMaxWidth()
@@ -644,7 +675,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                 }
             }
 
-            // Playback speed selector overlay.
             AnimatedVisibility(
                 showSpeeds,
                 enter = fadeIn(tween(150)) + scaleIn(initialScale = .92f),
@@ -694,7 +724,6 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                 .background(C.Bg)
                 .statusBarsPadding(),
         ) {
-            // Portrait YouTube-style player container: exact original aspect ratio, capped cleanly for vertical Shorts.
             BoxWithConstraints(Modifier.fillMaxWidth()) {
                 val ratio = if (isAudioOnly) 16f / 9f else videoRatio.coerceIn(0.45f, 3f)
                 val targetH = (maxWidth / ratio).coerceAtMost(520.dp)
@@ -719,7 +748,18 @@ fun PlayerScreen(item: DlItem, onClose: () -> Unit) {
                 )
 
                 Spacer(Modifier.height(20.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Chip(
+                        label = when {
+                            savingGallery -> "Saving…"
+                            savedToGallery -> "In Gallery"
+                            else -> "Show in Gallery"
+                        },
+                        selected = savedToGallery,
+                    ) { requestExport() }
                     Chip("Speed ${fmtSpeed(SPEEDS[speedIdx])}", speedIdx != 2) {
                         speedIdx = (speedIdx + 1) % SPEEDS.size
                         player.playbackParameters = PlaybackParameters(SPEEDS[speedIdx])
