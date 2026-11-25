@@ -60,6 +60,7 @@ object Engine {
 
     val job = MutableStateFlow(JobState())
     val items = MutableStateFlow<List<DlItem>>(emptyList())
+    val autoGallery = MutableStateFlow(false)
 
     val dir: File
         get() = File(app.filesDir, "videos").apply {
@@ -69,6 +70,12 @@ object Engine {
 
     private val index get() = File(dir, "index.json")
     private val pausedFile get() = File(dir, "paused.json")
+    private fun prefs() = app.getSharedPreferences("ytgrab_prefs", Context.MODE_PRIVATE)
+
+    fun setAutoGallery(enabled: Boolean) {
+        autoGallery.value = enabled
+        runCatching { prefs().edit().putBoolean("auto_gallery", enabled).apply() }
+    }
 
     private fun partialDir(url: String, height: Int?, startSec: Long): File {
         val key = "$url|${height ?: 0}|$startSec".hashCode().toUInt().toString(16)
@@ -108,6 +115,7 @@ object Engine {
 
     fun init(application: Application) {
         app = application
+        autoGallery.value = runCatching { prefs().getBoolean("auto_gallery", false) }.getOrDefault(false)
         items.value = runCatching {
             val arr = JSONArray(index.readText())
             (0 until arr.length()).map {
@@ -373,6 +381,9 @@ object Engine {
         val item = DlItem(id, info.title, out.name, thumbName, label, out.length(), System.currentTimeMillis())
         items.update { listOf(item) + it }
         save()
+        if (autoGallery.value) {
+            exportToGallery(app, item)
+        }
         job.value = JobState(finished = true, title = info.title, progress = 1f)
     }
 

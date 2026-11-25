@@ -18,6 +18,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -67,10 +68,13 @@ private fun size(b: Long): String =
 fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
     val items by Engine.items.collectAsState()
     val job by Engine.job.collectAsState()
+    val autoGallery by Engine.autoGallery.collectAsState()
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var confirm by remember { mutableStateOf<DlItem?>(null) }
+    var showSettings by remember { mutableStateOf(false) }
     var pendingExport by remember { mutableStateOf<DlItem?>(null) }
+    var pendingAutoToggle by remember { mutableStateOf(false) }
     var exportingId by remember { mutableStateOf<String?>(null) }
 
     fun doExport(item: DlItem) {
@@ -89,10 +93,13 @@ fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
 
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         val item = pendingExport
+        val wantAuto = pendingAutoToggle
         pendingExport = null
-        if (granted && item != null) {
-            doExport(item)
-        } else if (!granted) {
+        pendingAutoToggle = false
+        if (granted) {
+            if (wantAuto) Engine.setAutoGallery(true)
+            if (item != null) doExport(item)
+        } else {
             Toast.makeText(ctx, "Storage permission needed to save to Gallery", Toast.LENGTH_SHORT).show()
         }
     }
@@ -108,9 +115,40 @@ fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
         }
     }
 
+    fun toggleAutoGallery() {
+        if (autoGallery) {
+            Engine.setAutoGallery(false)
+            return
+        }
+        if (Build.VERSION.SDK_INT < 29 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingAutoToggle = true
+            permLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            Engine.setAutoGallery(true)
+        }
+    }
+
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
-            Header("Downloads")
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Header("Downloads")
+                Box(
+                    Modifier
+                        .padding(top = 18.dp)
+                        .size(42.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(C.Surface)
+                        .border(1.dp, C.Line, RoundedCornerShape(14.dp))
+                        .pressable { showSettings = true },
+                    contentAlignment = Alignment.Center,
+                ) { Glyph(G.Settings, C.Text, 21.dp) }
+            }
             Spacer(Modifier.height(18.dp))
 
             if (items.isEmpty() && !job.active && !job.paused) {
@@ -174,6 +212,49 @@ fun DownloadsScreen(onGoHome: () -> Unit, onPlay: (DlItem) -> Unit) {
                                 contentAlignment = Alignment.Center,
                             ) { Glyph(G.Trash, C.Red, 19.dp) }
                         }
+                    }
+                }
+            }
+        }
+
+        AnimatedVisibility(showSettings, enter = fadeIn(tween(200)), exit = fadeOut(tween(200))) {
+            Box(
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = .6f))
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { showSettings = false },
+                contentAlignment = Alignment.Center,
+            ) {
+                AnimatedVisibility(true, enter = scaleIn(initialScale = .9f) + fadeIn(), exit = scaleOut() + fadeOut()) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(28.dp).clip(RoundedCornerShape(26.dp)).background(C.Surface)
+                            .border(1.dp, C.Line, RoundedCornerShape(26.dp))
+                            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
+                            .padding(22.dp)
+                    ) {
+                        Text("Settings", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = C.Text)
+                        Spacer(Modifier.height(18.dp))
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(C.Bg)
+                                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { toggleAutoGallery() }
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                                Text("Always save to Gallery", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = C.Text)
+                                Text(
+                                    "Automatically add every new download to Movies/Ytgrab.",
+                                    fontSize = 12.sp,
+                                    color = C.Muted,
+                                    modifier = Modifier.padding(top = 3.dp),
+                                )
+                            }
+                            Toggle(checked = autoGallery, onToggle = ::toggleAutoGallery)
+                        }
+                        Spacer(Modifier.height(20.dp))
+                        Box(
+                            Modifier.fillMaxWidth().pressable { showSettings = false }.clip(RoundedCornerShape(16.dp))
+                                .background(C.Surface2).padding(vertical = 13.dp),
+                            contentAlignment = Alignment.Center,
+                        ) { Text("Done", color = C.Text, fontWeight = FontWeight.Medium) }
                     }
                 }
             }

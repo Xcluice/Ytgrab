@@ -116,7 +116,7 @@ fun Modifier.pressable(enabled: Boolean = true, onClick: () -> Unit): Modifier =
         .clickable(interactionSource = src, indication = null, enabled = enabled, onClick = onClick)
 }
 
-enum class G { Home, Down, Trash, Paste, Close, Play, Check, Gallery }
+enum class G { Home, Down, Trash, Paste, Close, Play, Check, Gallery, Settings }
 
 @Composable
 fun Glyph(g: G, tint: Color, size: Dp = 22.dp, strokeDp: Float = 2f) {
@@ -157,6 +157,20 @@ fun Glyph(g: G, tint: Color, size: Dp = 22.dp, strokeDp: Float = 2f) {
                 drawPath(Path().apply {
                     m(.22f, .72f); l(.42f, .48f); l(.58f, .64f); l(.7f, .52f); l(.82f, .72f)
                 }, tint, style = st)
+            }
+            G.Settings -> {
+                // Clean 3-slider settings icon
+                drawPath(Path().apply {
+                    m(.16f, .28f); l(.84f, .28f)
+                    m(.16f, .5f); l(.84f, .5f)
+                    m(.16f, .72f); l(.84f, .72f)
+                }, tint, style = st)
+                drawCircle(C.Surface, .095f * w, Offset(.34f * w, .28f * w))
+                drawCircle(tint, .095f * w, Offset(.34f * w, .28f * w), style = st)
+                drawCircle(C.Surface, .095f * w, Offset(.66f * w, .5f * w))
+                drawCircle(tint, .095f * w, Offset(.66f * w, .5f * w), style = st)
+                drawCircle(C.Surface, .095f * w, Offset(.42f * w, .72f * w))
+                drawCircle(tint, .095f * w, Offset(.42f * w, .72f * w), style = st)
             }
         }
     }
@@ -205,6 +219,28 @@ fun Chip(label: String, selected: Boolean, onClick: () -> Unit) {
             .background(bg)
             .padding(horizontal = 18.dp, vertical = 11.dp)
     ) { Text(label, color = fg, fontSize = 14.sp, fontWeight = FontWeight.Medium) }
+}
+
+@Composable
+fun Toggle(checked: Boolean, onToggle: () -> Unit) {
+    val bg by animateColorAsState(if (checked) C.Teal else C.Surface2, tween(220), label = "tbg")
+    val x by animateDpAsState(if (checked) 22.dp else 2.dp, spring(.65f, 450f), label = "tx")
+    Box(
+        Modifier
+            .size(48.dp, 28.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(bg)
+            .pressable(onClick = onToggle),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Box(
+            Modifier
+                .offset(x = x)
+                .size(24.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.White)
+        )
+    }
 }
 
 @Composable

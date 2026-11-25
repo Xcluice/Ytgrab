@@ -47,6 +47,7 @@ class Plan(val video: String?, val audio: String?)
 object Extractor {
     private var ready = false
     private val allowed = listOf(144, 240, 360, 480, 720, 1080)
+    private val resRegex = Regex("(\\d+)p", RegexOption.IGNORE_CASE)
 
     fun init() {
         if (!ready) {
@@ -60,6 +61,21 @@ object Extractor {
     private fun prog(s: Stream) = s.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP
     private fun isAv1(s: VideoStream) = s.codec?.startsWith("av01", ignoreCase = true) == true
     private fun isH264(s: VideoStream) = s.codec?.startsWith("avc1", ignoreCase = true) == true
+
+    /**
+     * Resolves the standard quality tier for both landscape videos (e.g. 640x360 -> 360)
+     * and vertical Shorts (e.g. 360x640 -> 360, 720x1280 -> 720).
+     */
+    private fun qualityOf(s: VideoStream): Int {
+        val fromLabel = resRegex.find(s.getResolution() ?: "")?.groupValues?.get(1)?.toIntOrNull()
+        val raw = when {
+            fromLabel != null && fromLabel > 0 -> fromLabel
+            s.width > 0 && s.height > 0 -> minOf(s.width, s.height)
+            else -> s.height
+        }
+        // Snap close non-standard values (e.g. 358 -> 360) to the nearest standard tier.
+        return allowed.firstOrNull { kotlin.math.abs(it - raw) <= 16 } ?: raw
+    }
 
     /**
      * Picks the original-language audio at the sweet-spot ~128 kbps AAC bitrate:
@@ -80,7 +96,7 @@ object Extractor {
     }
 
     /**
-     * Prefers H.264 at standard <=30fps and lowest bitrate at the requested height
+     * Prefers H.264 at standard <=30fps and lowest bitrate at the requested quality
      * to keep sharp quality while saving 30-50% mobile data and downloading faster.
      */
     private fun pickEfficientVideo(candidates: List<VideoStream>): VideoStream? {
@@ -96,7 +112,7 @@ object Extractor {
         val muxed = si.videoStreams.filter { prog(it) && it.format == MediaFormat.MPEG_4 && !isAv1(it) }
         val vOnly = si.videoOnlyStreams.filter { prog(it) && it.format == MediaFormat.MPEG_4 && !isAv1(it) }
         val aud = si.audioStreams.filter { prog(it) && it.format == MediaFormat.M4A }
-        val heights = (muxed + vOnly).map { it.height }.filter { it in allowed }.distinct().sorted()
+        val heights = (muxed + vOnly).map(::qualityOf).filter { it in allowed }.distinct().sorted()
         VideoInfo(
             url = url.trim(),
             title = si.name,
@@ -116,8 +132,8 @@ object Extractor {
             val a = bestAudio ?: error("No audio stream available for this video")
             return Plan(null, a.content)
         }
-        val m = pickEfficientVideo(info.muxed.filter { it.height == height })
-        val v = pickEfficientVideo(info.vOnly.filter { it.height == height })
+        val m = pickEfficientVideo(info.muxed.filter { qualityOf(it) == height })
+        val v = pickEfficientVideo(info.vOnly.filter { qualityOf(it) == height })
         // If multi-language/dubbed audio tracks exist, avoid muxed 360p which YouTube may auto-dub.
         val hasMultiAudio = info.audio.any {
             it.audioTrackType == AudioTrackType.ORIGINAL || it.audioTrackType == AudioTrackType.DUBBED
